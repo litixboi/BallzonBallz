@@ -180,7 +180,7 @@ def test_single_node(line, current_idx, total_nodes):
 
 def rebrand_config(config_line, country_key, index):
     meta = COUNTRY_DATA.get(country_key, COUNTRY_DATA["Others"])
-    new_remark = f"{meta['flag']} {meta['abbrev']} | litixconnect #{index}"
+    new_remark = f"{meta['flag']} {meta['abbrev']} | litixconnect #{index} | {CHANNEL_ID}"
 
     try:
         if config_line.startswith("vmess://"):
@@ -239,7 +239,7 @@ def generate_txt_file(configs, country_name):
     content += f"# Generated: {timestamp}\n"
     content += f"# Country: {country_name} ({meta['abbrev']})\n"
     content += f"# Total Configs: {len(configs)}\n"
-    content += f"# Source: Au1rxx free-vpn-subscriptions + Original Sources\n\n"
+    content += f"# Channel: {CHANNEL_ID}\n\n"
 
     for i, config in enumerate(configs, 1):
         rebranded = rebrand_config(config, country_name, i)
@@ -274,8 +274,7 @@ def post_to_channel(country_name, configs):
         caption = (
             f"{meta['flag']} <b>{country_name}</b> - {total} Working Configs\n"
             f"📅 Updated: {timestamp}\n"
-            f"🔗 Source: Au1rxx + Original Sources\n\n"
-            f"#VPN #FreeVPN #{meta['code']} #LitixConnect"
+            f"🔗 Channel: {CHANNEL_ID}"
         )
 
         with open(temp_path, 'rb') as doc:
@@ -413,7 +412,7 @@ def send_welcome(message):
         f"Welcome to the **LitixConnect Service**!\n\n"
         f"📍 **{len(countries)} Countries Available**: {country_list}\n\n"
         f"Select a location button to receive **3 fresh configs** + **full .txt file** with all configs for that country.\n\n"
-        f"📢 Auto-posts to channel: {CHANNEL_ID}",
+        f"🔗 Channel: {CHANNEL_ID}",
         reply_markup=markup,
         parse_mode="Markdown"
     )
@@ -487,7 +486,7 @@ def handle_country_request(message):
                     visible_file_name=filename,
                     caption=f"📄 **All {total_available} Configs for {selected_button}**\n"
                            f"📅 Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                           f"🔗 Source: Au1rxx + Original Sources"
+                           f"🔗 Channel: {CHANNEL_ID}"
                 )
 
             os.unlink(temp_path)
