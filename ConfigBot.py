@@ -294,6 +294,63 @@ def post_to_channel(country_name, configs):
         print(f"⚠️ Failed to post {country_name} to channel: {e}")
         return False
 
+def create_update_banner():
+    """Generate a visual banner image summarizing the latest config update"""
+    from PIL import Image, ImageDraw, ImageFont
+
+    width, height = 1280, 800
+    img = Image.new("RGB", (width, height))
+    draw = ImageDraw.Draw(img)
+
+    top = (15, 23, 42)
+    bottom = (76, 29, 149)
+    for y in range(height):
+        t = y / height
+        color = tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3))
+        draw.line([(0, y), (width, y)], fill=color)
+
+    def font(size):
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+    title_font = font(64)
+    sub_font = font(32)
+    small_font = font(26)
+    count_font = font(28)
+
+    draw.text((width // 2, 80), "LitixConnect", font=title_font, fill=(255, 255, 255), anchor="mm")
+    draw.text((width // 2, 145), "Fresh VPN Configs Updated", font=sub_font, fill=(165, 180, 252), anchor="mm")
+    draw.text((width // 2, 190), time.strftime("%Y-%m-%d  %H:%M UTC", time.gmtime()), font=small_font, fill=(148, 163, 184), anchor="mm")
+
+    entries = [(name, len(lines)) for name, lines in categorized_nodes.items() if lines and name != "Others"]
+    entries.sort(key=lambda e: e[1], reverse=True)
+
+    cols = 4
+    cell_w, cell_h = 290, 62
+    start_x = (width - cols * cell_w) // 2
+    start_y = 240
+
+    for i, (name, count) in enumerate(entries[:24]):
+        code = COUNTRY_DATA[name]["abbrev"]
+        col, row = i % cols, i // cols
+        x = start_x + col * cell_w + cell_w // 2
+        y = start_y + row * cell_h + cell_h // 2
+        draw.rounded_rectangle([x - 130, y - 24, x + 130, y + 24], radius=12, fill=(30, 41, 59), outline=(99, 102, 241), width=1)
+        draw.text((x, y), f"{code}   {count}", font=count_font, fill=(226, 232, 240), anchor="mm")
+
+    if len(entries) > 24:
+        draw.text((width // 2, start_y + 6 * cell_h + 20), f"+{len(entries) - 24} more countries", font=small_font, fill=(148, 163, 184), anchor="mm")
+
+    total = sum(len(lines) for lines in categorized_nodes.values())
+    draw.text((width // 2, height - 110), f"{total} verified configs across {len(entries)} countries", font=sub_font, fill=(255, 255, 255), anchor="mm")
+    draw.text((width // 2, height - 55), CHANNEL_ID, font=small_font, fill=(165, 180, 252), anchor="mm")
+
+    banner_path = script_dir / "update_banner.png"
+    img.save(banner_path)
+    return banner_path
+
 def post_all_countries_to_channel():
     """Post all countries with configs to the channel"""
     print(f"📢 Posting all countries to channel {CHANNEL_ID}...")
@@ -303,6 +360,21 @@ def post_all_countries_to_channel():
             if post_to_channel(country_name, lines):
                 posted += 1
                 time.sleep(1)  # Rate limit protection
+
+    try:
+        banner_path = create_update_banner()
+        total = sum(len(lines) for lines in categorized_nodes.values())
+        caption = (
+            f"✅ <b>Update Complete!</b>\n"
+            f"📦 {total} verified configs posted across {posted} countries\n"
+            f"🔗 {CHANNEL_ID}"
+        )
+        with open(banner_path, 'rb') as photo:
+            bot.send_photo(CHANNEL_ID, photo, caption=caption, parse_mode="HTML")
+        print("🖼️ Posted update banner to channel")
+    except Exception as e:
+        print(f"⚠️ Failed to post update banner: {e}")
+
     print(f"✅ Posted {posted} countries to channel")
 
 # --- CORE ASYNCHRONOUS POOL ENGINE ---
@@ -392,8 +464,8 @@ def update_configs_loop():
         # 7. Post to Telegram channel
         post_all_countries_to_channel()
 
-        print("🎉 High-speed background sync complete. Core memory updated. Next interval sweep in 1 hour.")
-        time.sleep(3600)
+        print("🎉 High-speed background sync complete. Core memory updated. Next interval sweep in 2 hours.")
+        time.sleep(7200)
 
 # --- BOT COMMANDS ---
 
