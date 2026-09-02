@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 *_configs.txt
 start.sh
+bot_state.json
+update_banner.png
+litixconnect_subscription.txt

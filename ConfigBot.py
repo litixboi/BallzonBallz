@@ -1,27 +1,43 @@
-import os
 import base64
+import html
 import json
+import logging
+import os
 import re
 import socket
-import time
-import threading
 import tempfile
-from pathlib import Path
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
+from pathlib import Path
+
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from dotenv import load_dotenv
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 import geoip2.database
-from requests.exceptions import ProxyError
+
+# --- LOGGING SETUP (timestamps + levels, ready for Railway logs) ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("ConfigBot")
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("TeleBot").setLevel(logging.WARNING)
 
 # --- CONTEXT-AWARE CONFIGURATION & ENV LOADING ---
 script_dir = Path(__file__).parent
-print(f"📁 Workspace active directory: {script_dir}")
+logger.info("Workspace active directory: %s", script_dir)
 
 load_dotenv(dotenv_path=script_dir / ".env")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@litixconnect")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # optional: locks /post to one chat id
 
 if not BOT_TOKEN:
     raise ValueError("❌ Error: BOT_TOKEN is missing! Check your .env file.")
@@ -37,15 +53,42 @@ if not MMDB_PATH.exists():
 
 geo_reader = geoip2.database.Reader(str(MMDB_PATH))
 
-# --- PROXY MIRROR TARGETS (Original Sources) ---
+# --- HTTP SESSION WITH RETRY/BACKOFF (survives GitHub blips) ---
+http_session = requests.Session()
+try:
+    _retry_policy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "HEAD"),
+    )
+except TypeError:  # very old urllib3 without allowed_methods
+    _retry_policy = Retry(total=3, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504))
+http_session.mount("https://", HTTPAdapter(max_retries=_retry_policy))
+
+# --- ORIGINAL SOURCES (direct GitHub first, mirror as automatic fallback) ---
 SOURCES = [
-    "https://ghproxy.net/https://raw.githubusercontent.com/wenxig/free-nodes-sub/main/data/sub.txt",
-    "https://ghproxy.net/https://raw.githubusercontent.com/cbusifabcap/daily_free_vpn/main/Z.txt",
-    "https://ghproxy.net/https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY.txt"
+    "https://raw.githubusercontent.com/wenxig/free-nodes-sub/main/data/sub.txt",
+    "https://raw.githubusercontent.com/cbusifabcap/daily_free_vpn/main/Z.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY.txt",
 ]
+MIRROR_PREFIX = "https://ghproxy.net/"
+
+
+def http_get(url, timeout=10):
+    """GET with retry/backoff; falls back to the ghproxy mirror if raw GitHub is unreachable."""
+    try:
+        return http_session.get(url, timeout=timeout)
+    except Exception as e:
+        if "raw.githubusercontent.com/" in url:
+            logger.warning("Direct fetch failed (%s) - retrying via ghproxy mirror", e)
+            return http_session.get(MIRROR_PREFIX + url, timeout=timeout)
+        raise
+
 
 # --- AU1RXX GITHUB SOURCE (Country-specific v2ray configs) ---
 AU1RXX_BASE = "https://raw.githubusercontent.com/Au1rxx/free-vpn-subscriptions/main/output/country"
+AU1RXX_PARTS = 5  # fetch v2ray-base64-0001.txt ... -0005.txt, stop at the first 404
 AU1RXX_COUNTRIES = {
     "DE": "Germany",
     "NL": "Netherlands",
@@ -125,9 +168,67 @@ BUTTON_TO_COUNTRY["Others"] = "Others"
 categorized_nodes = {k: [] for k in BUTTON_TO_COUNTRY.keys()}
 user_session_offsets = {}
 offsets_lock = threading.Lock()
+last_update_time = None  # human-readable UTC string of the last successful scan
+
+MAX_TRACKED_USERS = 2000   # cap on user_session_offsets to bound memory
+UPDATE_INTERVAL = 2 * 60 * 60  # 2 hours, aligned to even UTC hour boundaries
+STATE_PATH = script_dir / "bot_state.json"
+
+
+# --- STATE PERSISTENCE (survives process restarts) ---
+def save_state():
+    """Persist cache + rotation state so a restart doesn't start cold."""
+    try:
+        with offsets_lock:
+            offsets_snapshot = {str(k): v for k, v in user_session_offsets.items()}
+        state = {"nodes": categorized_nodes, "offsets": offsets_snapshot, "last_update": last_update_time}
+        tmp = STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.replace(STATE_PATH)
+    except Exception as e:
+        logger.warning("Failed to save state: %s", e)
+
+
+def load_state():
+    """Restore the cache + rotation state written by a previous run."""
+    global categorized_nodes, user_session_offsets, last_update_time
+    try:
+        if not STATE_PATH.exists():
+            return
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        nodes = state.get("nodes") or {}
+        for key in categorized_nodes:
+            if isinstance(nodes.get(key), list):
+                categorized_nodes[key] = [l for l in nodes[key] if isinstance(l, str)]
+        offsets = state.get("offsets") or {}
+        with offsets_lock:
+            for chat_id, per_country in offsets.items():
+                if isinstance(per_country, dict):
+                    try:
+                        user_session_offsets[int(chat_id)] = {
+                            k: v for k, v in per_country.items() if isinstance(v, int)
+                        }
+                    except ValueError:
+                        continue
+        last_update_time = state.get("last_update")
+        total = sum(len(v) for v in categorized_nodes.values())
+        logger.info("Restored state: %d configs, %d users, last update %s",
+                    total, len(user_session_offsets), last_update_time)
+    except Exception as e:
+        logger.warning("Failed to load state: %s", e)
+
+
+def prune_offsets():
+    """Drop the oldest tracked users if the rotation table grows unbounded."""
+    with offsets_lock:
+        excess = len(user_session_offsets) - MAX_TRACKED_USERS
+        if excess > 0:
+            for chat_id in list(user_session_offsets.keys())[:excess]:
+                del user_session_offsets[chat_id]
+            logger.info("Pruned %d stale user rotation entries", excess)
+
 
 # --- UTILITY PARSING AND TESTING PIPELINES ---
-
 def extract_host_and_port(config_line):
     try:
         if config_line.startswith("vmess://"):
@@ -145,6 +246,7 @@ def extract_host_and_port(config_line):
         pass
     return None, None
 
+
 def get_country_local(host):
     try:
         ip = socket.gethostbyname(host)
@@ -156,14 +258,24 @@ def get_country_local(host):
     except Exception:
         return "Others"
 
-def test_single_node(line, current_idx, total_nodes):
+
+def node_key(config_line):
+    """Stable identity for a node: scheme + host + port (ignores remark variations)."""
+    host, port = extract_host_and_port(config_line)
+    if not host or not port:
+        return None
+    scheme = config_line.split("://", 1)[0].lower()
+    return f"{scheme}://{host.lower()}:{port}"
+
+
+def test_single_node(line):
     host, port = extract_host_and_port(line)
     if not host or not port:
         return None
 
     try:
-        socket.setdefaulttimeout(2.0)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2.0)
             s.connect((host, port))
 
         country_name = get_country_local(host)
@@ -177,6 +289,7 @@ def test_single_node(line, current_idx, total_nodes):
         return {"bucket": assigned_bucket, "raw_line": line}
     except (socket.timeout, socket.error):
         return None
+
 
 def rebrand_config(config_line, country_key, index):
     meta = COUNTRY_DATA.get(country_key, COUNTRY_DATA["Others"])
@@ -198,6 +311,7 @@ def rebrand_config(config_line, country_key, index):
         pass
     return config_line
 
+
 def decode_base64_content(content):
     """Try to decode base64 content, return original if not base64"""
     try:
@@ -211,24 +325,36 @@ def decode_base64_content(content):
         return content.splitlines()
 
 def fetch_au1rxx_configs():
-    """Fetch v2ray configs from Au1rxx GitHub repo for all supported countries"""
+    """Fetch v2ray configs from Au1rxx GitHub repo for all supported countries.
+
+    Bigger countries publish multiple parts (v2ray-base64-0001.txt, -0002.txt, ...);
+    we walk them until the first 404 so no configs are left behind.
+    """
     configs_by_country = {country: [] for country in COUNTRY_DATA.keys()}
 
     for country_code, country_name in AU1RXX_COUNTRIES.items():
-        try:
-            url = f"{AU1RXX_BASE}/{country_code}/v2ray-base64-0001.txt"
-            res = requests.get(url, timeout=15)
-            if res.status_code == 200:
+        fetched = 0
+        for part in range(1, AU1RXX_PARTS + 1):
+            url = f"{AU1RXX_BASE}/{country_code}/v2ray-base64-{part:04d}.txt"
+            try:
+                res = http_get(url, timeout=15)
+                if res.status_code == 404:
+                    break  # no more parts for this country
+                if res.status_code != 200:
+                    logger.warning("Au1rxx %s part %d: HTTP %d", country_code, part, res.status_code)
+                    break
                 lines = decode_base64_content(res.text)
                 valid_lines = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
                 configs_by_country[country_name].extend(valid_lines)
-                print(f"✅ Fetched {len(valid_lines)} configs for {country_name} ({country_code}) from Au1rxx")
-            else:
-                print(f"⚠️ No Au1rxx config for {country_name} ({country_code}): HTTP {res.status_code}")
-        except Exception as e:
-            print(f"⚠️ Au1rxx fetch error for {country_name} ({country_code}): {e}")
+                fetched += len(valid_lines)
+            except Exception as e:
+                logger.warning("Au1rxx fetch error for %s (%s) part %d: %s", country_name, country_code, part, e)
+                break
+        if fetched:
+            logger.info("Fetched %d configs for %s (%s) from Au1rxx", fetched, country_name, country_code)
 
     return configs_by_country
+
 
 def generate_txt_file(configs, country_name):
     """Generate a .txt file with all configs for a country"""
@@ -247,30 +373,97 @@ def generate_txt_file(configs, country_name):
 
     return content
 
+
+def generate_subscription_content():
+    """One combined base64 file: v2rayNG/V2Box/Nekoray can import it as a subscription."""
+    all_lines = []
+    for country_name, lines in categorized_nodes.items():
+        if lines and country_name != "Others":
+            all_lines.extend(lines)
+    if not all_lines:
+        return None
+    joined = "\n".join(all_lines)
+    return base64.b64encode(joined.encode("utf-8")).decode("ascii")
+
+
+# --- SAFE TELEGRAM SENDERS (Markdown/HTML parse errors and 429 flood waits) ---
+def send_message_safe(chat_id, text, **kwargs):
+    """Send a text message; on parse-mode errors retry plain, on 429 wait as long as Telegram asks."""
+    for attempt in range(3):
+        try:
+            return bot.send_message(chat_id, text, **kwargs)
+        except ApiTelegramException as e:
+            retry_after = getattr(e, "result_payload", {}).get("parameters", {}).get("retry_after")
+            if retry_after:
+                logger.warning("Flood limit hit, waiting %ds (attempt %d)", retry_after, attempt + 1)
+                time.sleep(retry_after + 1)
+                continue
+            if "parse" in str(e).lower():
+                logger.warning("Parse error, retrying without parse_mode: %s", e)
+                kwargs.pop("parse_mode", None)
+                kwargs.pop("reply_markup", None)
+                continue
+            raise
+    raise RuntimeError("send_message_safe: retries exhausted")
+
+
+def send_document_safe(chat_id, doc, **kwargs):
+    """Send a document; on 429 wait as long as Telegram asks, then retry."""
+    for attempt in range(3):
+        try:
+            return bot.send_document(chat_id, doc, **kwargs)
+        except ApiTelegramException as e:
+            retry_after = getattr(e, "result_payload", {}).get("parameters", {}).get("retry_after")
+            if retry_after:
+                logger.warning("Flood limit hit, waiting %ds (attempt %d)", retry_after, attempt + 1)
+                time.sleep(retry_after + 1)
+                continue
+            if "parse" in str(e).lower():
+                kwargs.pop("parse_mode", None)
+                continue
+            raise
+    raise RuntimeError("send_document_safe: retries exhausted")
+
+
+def send_photo_safe(chat_id, photo, **kwargs):
+    """Send a photo; on 429 wait as long as Telegram asks, then retry."""
+    for attempt in range(3):
+        try:
+            return bot.send_photo(chat_id, photo, **kwargs)
+        except ApiTelegramException as e:
+            retry_after = getattr(e, "result_payload", {}).get("parameters", {}).get("retry_after")
+            if retry_after:
+                logger.warning("Flood limit hit, waiting %ds (attempt %d)", retry_after, attempt + 1)
+                time.sleep(retry_after + 1)
+                continue
+            if "parse" in str(e).lower():
+                kwargs.pop("parse_mode", None)
+                continue
+            raise
+    raise RuntimeError("send_photo_safe: retries exhausted")
+
+
 def post_to_channel(country_name, configs):
     """Post configs for a country to the Telegram channel"""
     if not CHANNEL_ID:
-        print("⚠️ CHANNEL_ID not set, skipping channel post")
+        logger.warning("CHANNEL_ID not set, skipping channel post")
+        return False
+
+    total = len(configs)
+    if total == 0:
         return False
 
     try:
-        total = len(configs)
-        if total == 0:
-            return False
-
         meta = COUNTRY_DATA.get(country_name, COUNTRY_DATA["Others"])
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Generate .txt file content
         txt_content = generate_txt_file(configs, country_name)
         filename = f"{meta['code'].lower()}_configs.txt"
 
-        # Create temp file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
             f.write(txt_content)
             temp_path = f.name
 
-        # Caption for the post
         caption = (
             f"{meta['flag']} <b>{country_name}</b> - {total} Working Configs\n"
             f"📅 Updated: {timestamp}\n"
@@ -278,7 +471,7 @@ def post_to_channel(country_name, configs):
         )
 
         with open(temp_path, 'rb') as doc:
-            bot.send_document(
+            send_document_safe(
                 CHANNEL_ID,
                 doc,
                 visible_file_name=filename,
@@ -287,12 +480,13 @@ def post_to_channel(country_name, configs):
             )
 
         os.unlink(temp_path)
-        print(f"✅ Posted {country_name} ({total} configs) to channel")
+        logger.info("Posted %s (%d configs) to channel", country_name, total)
         return True
 
     except Exception as e:
-        print(f"⚠️ Failed to post {country_name} to channel: {e}")
+        logger.warning("Failed to post %s to channel: %s", country_name, e)
         return False
+
 
 def create_update_banner():
     """Generate a visual banner image summarizing the latest config update"""
@@ -351,15 +545,16 @@ def create_update_banner():
     img.save(banner_path)
     return banner_path
 
+
 def post_all_countries_to_channel():
     """Post all countries with configs to the channel"""
-    print(f"📢 Posting all countries to channel {CHANNEL_ID}...")
+    logger.info("Posting all countries to channel %s...", CHANNEL_ID)
     posted = 0
     for country_name, lines in categorized_nodes.items():
         if lines and country_name != "Others":
             if post_to_channel(country_name, lines):
                 posted += 1
-                time.sleep(1)  # Rate limit protection
+                time.sleep(1)  # stay comfortably under the ~1 msg/sec channel limit
 
     try:
         banner_path = create_update_banner()
@@ -370,86 +565,132 @@ def post_all_countries_to_channel():
             f"🔗 {CHANNEL_ID}"
         )
         with open(banner_path, 'rb') as photo:
-            bot.send_photo(CHANNEL_ID, photo, caption=caption, parse_mode="HTML")
-        print("🖼️ Posted update banner to channel")
+            send_photo_safe(CHANNEL_ID, photo, caption=caption, parse_mode="HTML")
+        logger.info("Posted update banner to channel")
     except Exception as e:
-        print(f"⚠️ Failed to post update banner: {e}")
+        logger.warning("Failed to post update banner: %s", e)
 
-    print(f"✅ Posted {posted} countries to channel")
+    try:
+        sub_content = generate_subscription_content()
+        if sub_content:
+            sub_name = "litixconnect_subscription.txt"
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+                f.write(sub_content)
+                sub_path = f.name
+            caption = (
+                "📦 <b>All-in-one Subscription File</b>\n"
+                "Import this file in v2rayNG / V2Box / Nekoray to load every config at once.\n"
+                f"🔗 {CHANNEL_ID}"
+            )
+            with open(sub_path, 'rb') as doc:
+                send_document_safe(CHANNEL_ID, doc, visible_file_name=sub_name, caption=caption, parse_mode="HTML")
+            os.unlink(sub_path)
+            logger.info("Posted combined subscription file to channel")
+    except Exception as e:
+        logger.warning("Failed to post subscription file: %s", e)
+
+    logger.info("Posted %d countries to channel", posted)
 
 # --- CORE ASYNCHRONOUS POOL ENGINE ---
+def seconds_until_next_aligned_slot(now=None):
+    """Wait until the next even UTC hour boundary (00:00, 02:00, 04:00 ...) so posts land on a predictable schedule."""
+    now = now or time.time()
+    next_slot = (int(now // UPDATE_INTERVAL) + 1) * UPDATE_INTERVAL
+    return max(1.0, next_slot - now)
+
 
 def update_configs_loop():
-    global categorized_nodes
+    global categorized_nodes, last_update_time
 
     while True:
-        print("\n🔄 Starting high-speed concurrent configuration update...")
+        logger.info("Starting high-speed concurrent configuration update...")
         temp_storage = {k: [] for k in BUTTON_TO_COUNTRY.keys()}
         raw_lines = []
+        seen_keys = set()  # global dedup across ALL sources (same host:port never served twice)
 
         # 1. Fetch from original sources
         for url in SOURCES:
             try:
-                res = requests.get(url, timeout=10)
+                res = http_get(url, timeout=10)
                 if res.status_code == 200:
-                    content = res.text
-                    lines = decode_base64_content(content)
+                    lines = decode_base64_content(res.text)
                     raw_lines.extend(lines)
+                else:
+                    logger.warning("Original source %s returned HTTP %d", url, res.status_code)
             except Exception as e:
-                print(f"⚠️ Original source read exception: {e}")
+                logger.warning("Original source read exception: %s", e)
 
-        # 2. Fetch from Au1rxx GitHub (country-specific)
-        print("📥 Fetching from Au1rxx GitHub repository...")
+        # 2. Fetch from Au1rxx GitHub (country-specific, multi-part)
+        logger.info("Fetching from Au1rxx GitHub repository...")
         au1rxx_configs = fetch_au1rxx_configs()
         for country_name, lines in au1rxx_configs.items():
             if country_name in temp_storage:
                 temp_storage[country_name].extend(lines)
-            elif country_name == "Others" and "Others" in temp_storage:
-                temp_storage["Others"].extend(lines)
 
         # 3. Test all unique configs from original sources
-        unique_original = list(set([line.strip() for line in raw_lines if line.strip()]))
-        total_count = len(unique_original)
-        print(f"🔍 Discovered {total_count} original nodes. Launching multi-threaded pipeline...")
+        unique_original = []
+        for line in raw_lines:
+            line = line.strip()
+            if not line:
+                continue
+            key = node_key(line)
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            unique_original.append(line)
+
+        logger.info("Discovered %d original nodes. Launching multi-threaded pipeline...", len(unique_original))
 
         active_found = 0
         with ThreadPoolExecutor(max_workers=70) as executor:
-            futures = {executor.submit(test_single_node, line, i, total_count): line for i, line in enumerate(unique_original, 1)}
-
+            futures = [executor.submit(test_single_node, line) for line in unique_original]
             for future in as_completed(futures):
                 result = future.result()
                 if result:
                     active_found += 1
-                    bucket = result["bucket"]
-                    temp_storage[bucket].append(result["raw_line"])
+                    temp_storage[result["bucket"]].append(result["raw_line"])
 
-        # 4. Au1rxx configs are already country-sorted, just test connectivity
-        print("🔍 Testing Au1rxx pre-sorted configs...")
+        # 4. Au1rxx configs: already country-sorted, test connectivity + dedup against everything above
+        logger.info("Testing Au1rxx pre-sorted configs...")
         for country_name, lines in au1rxx_configs.items():
-            if country_name not in temp_storage:
+            bucket_lines = []
+            for line in lines:
+                key = node_key(line)
+                if key and key in seen_keys:
+                    continue  # already present from another source
+                if key:
+                    seen_keys.add(key)
+                bucket_lines.append(line)
+            if not bucket_lines:
                 continue
-            bucket = country_name
-            tested = 0
             with ThreadPoolExecutor(max_workers=30) as executor:
-                futures = {executor.submit(test_single_node, line, i, len(lines)): line for i, line in enumerate(lines, 1)}
+                futures = [executor.submit(test_single_node, line) for line in bucket_lines]
                 for future in as_completed(futures):
                     result = future.result()
                     if result:
                         active_found += 1
-                        temp_storage[bucket].append(result["raw_line"])
-                    tested += 1
+                        temp_storage[country_name].append(result["raw_line"])
 
-        print(f"✅ Scanning complete. Found {active_found} live nodes. Rebranding lists...")
+        total_found = sum(len(v) for v in temp_storage.values())
 
-        # 5. Rebrand all configs
+        # 5. Empty-scan guard: never wipe the channel's content because one source hiccupped
+        if total_found == 0:
+            logger.warning("Scan found 0 live nodes - keeping previous cache (%d configs) and retrying sooner",
+                           sum(len(v) for v in categorized_nodes.values()))
+            time.sleep(120)
+            continue
+
+        # 6. Rebrand all configs
         for bucket, lines in temp_storage.items():
             country_data_key = BUTTON_TO_COUNTRY[bucket]
             temp_storage[bucket] = [rebrand_config(line, country_data_key, idx) for idx, line in enumerate(lines, 1)]
 
         categorized_nodes = temp_storage
+        last_update_time = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
-        # 6. Generate and save .txt files for each country
-        print("📄 Generating .txt files for each country...")
+        # 7. Generate and save .txt files for each country
+        logger.info("Generating .txt files for each country...")
         for country_name, lines in categorized_nodes.items():
             if lines and country_name != "Others":
                 txt_content = generate_txt_file(lines, country_name)
@@ -457,56 +698,121 @@ def update_configs_loop():
                 filepath = script_dir / filename
                 try:
                     filepath.write_text(txt_content, encoding='utf-8')
-                    print(f"💾 Saved {len(lines)} configs to {filename}")
+                    logger.info("Saved %d configs to %s", len(lines), filename)
                 except Exception as e:
-                    print(f"⚠️ Failed to save {filename}: {e}")
+                    logger.warning("Failed to save %s: %s", filename, e)
 
-        # 7. Post to Telegram channel
+        # 8. Persist state, then post to Telegram channel
+        prune_offsets()
+        save_state()
         post_all_countries_to_channel()
 
-        print("🎉 High-speed background sync complete. Core memory updated. Next interval sweep in 2 hours.")
-        time.sleep(7200)
+        logger.info("Background sync complete. %d live nodes cached. Next sweep at the next even UTC hour.",
+                    total_found)
+        time.sleep(seconds_until_next_aligned_slot())
+
 
 # --- BOT COMMANDS ---
+def build_country_inline_keyboard():
+    """Inline keyboard: flag + name per button, 3 columns, Others last."""
+    countries = [c for c in BUTTON_TO_COUNTRY.keys() if c != "Others"]
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    buttons = []
+    for country in countries:
+        meta = COUNTRY_DATA[country]
+        buttons.append(types.InlineKeyboardButton(
+            f"{meta['flag']} {country}", callback_data=f"country:{country}"
+        ))
+    buttons.append(types.InlineKeyboardButton("🌐 Others", callback_data="country:Others"))
+    markup.add(*buttons)
+    return markup
+
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     countries = [c for c in BUTTON_TO_COUNTRY.keys() if c != "Others"]
-    markup = types.ReplyKeyboardMarkup(row_width=3, resize_keyboard=True)
-    buttons = [types.KeyboardButton(c) for c in countries]
-    buttons.append(types.KeyboardButton("Others"))
-    markup.add(*buttons)
-
-    country_list = ", ".join(countries[:10]) + "..."
+    last_line = f"🕒 Last update: {last_update_time}" if last_update_time else "🕒 First scan still in progress..."
 
     bot.reply_to(
         message,
-        f"Welcome to the **LitixConnect Service**!\n\n"
-        f"📍 **{len(countries)} Countries Available**: {country_list}\n\n"
-        f"Select a location button to receive **3 fresh configs** + **full .txt file** with all configs for that country.\n\n"
+        f"Welcome to the LitixConnect Service!\n\n"
+        f"📍 <b>{len(countries)} Countries Available</b> - tap one below to receive <b>3 fresh configs</b> "
+        f"plus the <b>full .txt file</b> with every config for that country.\n\n"
+        f"{last_line}\n"
         f"🔗 Channel: {CHANNEL_ID}",
-        reply_markup=markup,
-        parse_mode="Markdown"
+        reply_markup=build_country_inline_keyboard(),
+        parse_mode="HTML"
     )
+
+
+@bot.message_handler(commands=['status'])
+def send_status(message):
+    """Per-country counts + last update time so users know how fresh configs are."""
+    lines = []
+    total = 0
+    for country, nodes in categorized_nodes.items():
+        if country != "Others" and nodes:
+            meta = COUNTRY_DATA[country]
+            lines.append(f"{meta['flag']} {country}: <b>{len(nodes)}</b>")
+            total += len(nodes)
+    others = len(categorized_nodes.get("Others", []))
+    if others:
+        lines.append(f"🌐 Others: <b>{others}</b>")
+        total += others
+
+    if not lines:
+        body = "No configs cached yet - the first scan may still be running. Try again in a few minutes."
+    else:
+        body = "\n".join(lines)
+
+    last_line = f"🕒 Last update: {last_update_time}" if last_update_time else "🕒 First scan still in progress..."
+    bot.reply_to(
+        message,
+        f"📊 <b>Current Cache Status</b>\n\n{body}\n\n📦 Total: {total} configs\n{last_line}\n🔗 Channel: {CHANNEL_ID}",
+        parse_mode="HTML"
+    )
+
 
 @bot.message_handler(commands=['post'])
 def manual_post(message):
     """Manual command to post all countries to channel"""
-    if message.chat.type == 'private':
-        bot.reply_to(message, "📢 Posting all countries to channel...")
-        threading.Thread(target=post_all_countries_to_channel, daemon=True).start()
-        bot.reply_to(message, "✅ Posting started in background!")
+    if ADMIN_CHAT_ID and str(message.chat.id) != ADMIN_CHAT_ID:
+        bot.reply_to(message, "⛔ This command is restricted.")
+        return
+    bot.reply_to(message, "📢 Posting all countries to channel...")
+    threading.Thread(target=post_all_countries_to_channel, daemon=True).start()
+    bot.reply_to(message, "✅ Posting started in background!")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("country:"))
+def handle_country_request(call):
+    chat_id = call.message.chat.id
+    selected_button = call.data.split(":", 1)[1]
+
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    serve_country_to_chat(chat_id, selected_button)
+
 
 @bot.message_handler(func=lambda message: message.text in BUTTON_TO_COUNTRY.keys())
-def handle_country_request(message):
-    chat_id = message.chat.id
-    selected_button = message.text
+def handle_legacy_keyboard(message):
+    """Users who still hold the old reply keyboard send plain country text - serve them too."""
+    serve_country_to_chat(message.chat.id, message.text.strip())
 
+
+def serve_country_to_chat(chat_id, selected_button):
     master_nodes_list = categorized_nodes.get(selected_button, [])
     total_available = len(master_nodes_list)
 
     if total_available == 0:
-        bot.reply_to(message, f"⚠️ There are currently zero verified working configs for **{selected_button}** in cache. Please try again later.")
+        bot.send_message(
+            chat_id,
+            f"⚠️ There are currently zero verified working configs for <b>{selected_button}</b> in cache. Please try again later.",
+            parse_mode="HTML"
+        )
         return
 
     with offsets_lock:
@@ -517,7 +823,7 @@ def handle_country_request(message):
     inform_msg = ""
 
     if current_offset >= total_available:
-        inform_msg = f"⚠️ **Notice:** You have already seen all unique configurations for {selected_button}.\n🔄 *Resetting your rotation back to the beginning...*\n\n"
+        inform_msg = f"⚠️ <b>Notice:</b> You have already seen all unique configurations for {selected_button}.\n🔄 <i>Resetting your rotation back to the beginning...</i>\n\n"
         current_offset = 0
 
     start_idx = current_offset
@@ -526,54 +832,60 @@ def handle_country_request(message):
     served_count = len(nodes_to_serve)
 
     if served_count < 3 and start_idx != 0:
-        inform_msg = f"ℹ️ **Notice:** Only **{served_count}** new unique configs were remaining for {selected_button}. Running out of options soon!\n\n"
+        inform_msg = f"ℹ️ <b>Notice:</b> Only <b>{served_count}</b> new unique configs were remaining for {selected_button}. Running out of options soon!\n\n"
 
     if total_available < 3:
-        inform_msg = f"ℹ️ **Notice:** There are only {total_available} total configurations available in the system for this country. Repetition is inevitable.\n\n"
+        inform_msg = f"ℹ️ <b>Notice:</b> There are only {total_available} total configurations available in the system for this country. Repetition is inevitable.\n\n"
 
     with offsets_lock:
         user_session_offsets[chat_id][selected_button] = start_idx + served_count
 
-    # Send the 3 configs as text message
-    response_text = f"{inform_msg}✨ **Your 3 Verified Configs for {selected_button}:**\n\n"
-    for node in nodes_to_serve:
-        response_text += f"`{node}`\n\n"
+    # Send the 3 configs as a monospace text block (plain text - no parse errors possible)
+    response_text = f"{inform_msg}✨ <b>Your 3 Verified Configs for {selected_button}:</b>\n\n"
+    bot.send_message(chat_id, response_text, parse_mode="HTML")
 
-    bot.reply_to(message, response_text, parse_mode="Markdown")
+    for node in nodes_to_serve:
+        # plain text, no parse mode: configs can contain any characters without breaking Telegram
+        bot.send_message(chat_id, node)
 
     # Also send the full .txt file
-    if total_available > 0:
-        txt_content = generate_txt_file(master_nodes_list, selected_button)
-        filename = f"{COUNTRY_DATA[selected_button]['code'].lower()}_configs.txt"
+    txt_content = generate_txt_file(master_nodes_list, selected_button)
+    filename = f"{COUNTRY_DATA[selected_button]['code'].lower()}_configs.txt"
 
-        try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-                f.write(txt_content)
-                temp_path = f.name
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+            f.write(txt_content)
+            temp_path = f.name
 
-            with open(temp_path, 'rb') as doc:
-                bot.send_document(
-                    chat_id,
-                    doc,
-                    visible_file_name=filename,
-                    caption=f"📄 **All {total_available} Configs for {selected_button}**\n"
-                           f"📅 Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                           f"🔗 Channel: {CHANNEL_ID}"
-                )
+        with open(temp_path, 'rb') as doc:
+            send_document_safe(
+                chat_id,
+                doc,
+                visible_file_name=filename,
+                caption=(
+                    f"📄 <b>All {total_available} Configs for {selected_button}</b>\n"
+                    f"📅 Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"🔗 Channel: {CHANNEL_ID}"
+                ),
+                parse_mode="HTML"
+            )
 
-            os.unlink(temp_path)
-        except Exception as e:
-            print(f"⚠️ Failed to send .txt file: {e}")
+        os.unlink(temp_path)
+    except Exception as e:
+        logger.warning("Failed to send .txt file: %s", e)
+
 
 if __name__ == "__main__":
+    load_state()
+
     updater_thread = threading.Thread(target=update_configs_loop, daemon=True)
     updater_thread.start()
 
-    print("🤖 Resilient Telegram operational routing loop initializing...")
+    logger.info("Resilient Telegram operational routing loop initializing...")
     while True:
         try:
-            print("Starting Telegram bot polling...")
+            logger.info("Starting Telegram bot polling...")
             bot.infinity_polling(timeout=60, long_polling_timeout=30)
         except Exception as e:
-            print(f"Polling encountered an error: {e}")
+            logger.error("Polling encountered an error: %s", e)
             time.sleep(15)
