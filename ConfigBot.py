@@ -3,6 +3,7 @@ import html
 import json
 import logging
 import os
+import random
 import re
 import socket
 import tempfile
@@ -173,6 +174,8 @@ last_update_time = None  # human-readable UTC string of the last successful scan
 MAX_TRACKED_USERS = 2000   # cap on user_session_offsets to bound memory
 UPDATE_INTERVAL = 2 * 60 * 60  # 2 hours, aligned to even UTC hour boundaries
 STATE_PATH = script_dir / "bot_state.json"
+TOP_PICKS_COUNTRIES = 5      # quick-picks file covers the countries with the most live configs
+TOP_PICKS_PER_COUNTRY = 50   # random picks per top country, never two on the same address
 
 
 # --- STATE PERSISTENCE (survives process restarts) ---
@@ -386,6 +389,64 @@ def generate_subscription_content():
     return base64.b64encode(joined.encode("utf-8")).decode("ascii")
 
 
+def pick_diverse_configs(lines, count):
+    """Pick up to `count` configs with all-distinct server addresses.
+
+    Groups configs by host address, keeps one per address (random within the group),
+    then samples across addresses - so 50 picks means 50 different servers,
+    spread over the whole address range instead of clustering on duplicates.
+    """
+    by_host = {}
+    for line in lines:
+        host, _port = extract_host_and_port(line)
+        if not host:
+            continue
+        by_host.setdefault(host.lower(), []).append(line)
+
+    if not by_host:
+        return []
+
+    # one random config per unique address, then shuffle so the sample
+    # isn't biased toward addresses that happened to appear first
+    one_per_host = [random.choice(group) for group in by_host.values()]
+    random.shuffle(one_per_host)
+
+    if len(one_per_host) <= count:
+        return one_per_host
+    return random.sample(one_per_host, count)
+
+
+def build_top_picks():
+    """Build the quick-picks content: TOP_PICKS_COUNTRIES countries with the most
+    live configs, TOP_PICKS_PER_COUNTRY randomly-chosen diverse configs each."""
+    ranked = sorted(
+        ((name, lines) for name, lines in categorized_nodes.items()
+         if lines and name != "Others"),
+        key=lambda item: len(item[1]),
+        reverse=True,
+    )
+    if not ranked:
+        return None
+
+    top = ranked[:TOP_PICKS_COUNTRIES]
+    sections = []
+    picked_countries = []
+    for country_name, lines in top:
+        picks = pick_diverse_configs(lines, TOP_PICKS_PER_COUNTRY)
+        if not picks:
+            continue
+        meta = COUNTRY_DATA[country_name]
+        section = [f"# {meta['flag']} {country_name} ({meta['abbrev']}) - {len(picks)} configs"]
+        for i, config in enumerate(picks, 1):
+            section.append(rebrand_config(config, country_name, i))
+        sections.append("\n".join(section))
+        picked_countries.append((country_name, len(picks)))
+
+    if not sections:
+        return None
+    return {"countries": picked_countries, "content": "\n\n".join(sections)}
+
+
 # --- SAFE TELEGRAM SENDERS (Markdown/HTML parse errors and 429 flood waits) ---
 def send_message_safe(chat_id, text, **kwargs):
     """Send a text message; on parse-mode errors retry plain, on 429 wait as long as Telegram asks."""
@@ -571,6 +632,28 @@ def post_all_countries_to_channel():
         logger.warning("Failed to post update banner: %s", e)
 
     try:
+        top_picks = build_top_picks()
+        if top_picks:
+            picks_line = ", ".join(f"{COUNTRY_DATA[name]['flag']} {name} ×{n}" for name, n in top_picks["countries"])
+            caption = (
+                "⚡ <b>Quick Picks - Top 5 Countries</b>\n"
+                f"{picks_line}\n\n"
+                "50 hand-picked configs per country, no duplicate servers - "
+                "a small file for users who don't want to scan the big ones.\n"
+                f"🔗 {CHANNEL_ID}"
+            )
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+                f.write(top_picks["content"])
+                picks_path = f.name
+            with open(picks_path, 'rb') as doc:
+                send_document_safe(CHANNEL_ID, doc, visible_file_name="top5_quick_picks.txt",
+                                   caption=caption, parse_mode="HTML")
+            os.unlink(picks_path)
+            logger.info("Posted top-5 quick picks file to channel")
+    except Exception as e:
+        logger.warning("Failed to post quick picks file: %s", e)
+
+    try:
         sub_content = generate_subscription_content()
         if sub_content:
             sub_name = "litixconnect_subscription.txt"
@@ -738,6 +821,9 @@ def send_welcome(message):
         f"Welcome to the LitixConnect Service!\n\n"
         f"📍 <b>{len(countries)} Countries Available</b> - tap one below to receive <b>3 fresh configs</b> "
         f"plus the <b>full .txt file</b> with every config for that country.\n\n"
+        f"⚡ Short on time? Send <b>/top</b> for a small file with 50 diverse configs from each of the "
+        f"top 5 countries.\n"
+        f"📊 Send <b>/status</b> to see live counts per country.\n\n"
         f"{last_line}\n"
         f"🔗 Channel: {CHANNEL_ID}",
         reply_markup=build_country_inline_keyboard(),
@@ -782,6 +868,43 @@ def manual_post(message):
     bot.reply_to(message, "📢 Posting all countries to channel...")
     threading.Thread(target=post_all_countries_to_channel, daemon=True).start()
     bot.reply_to(message, "✅ Posting started in background!")
+
+
+@bot.message_handler(commands=['top'])
+def send_top_picks(message):
+    """On-demand top-5 quick picks file (small, diverse, no duplicate servers)"""
+    total = sum(len(v) for v in categorized_nodes.values())
+    if total == 0:
+        bot.reply_to(message, "⚠️ No configs cached yet - the first scan may still be running. Try again in a few minutes.")
+        return
+
+    top_picks = build_top_picks()
+    if not top_picks:
+        bot.reply_to(message, "⚠️ Couldn't build quick picks right now. Try again after the next update.")
+        return
+
+    picks_line = ", ".join(f"{COUNTRY_DATA[name]['flag']} {name} ×{n}" for name, n in top_picks["countries"])
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+            f.write(top_picks["content"])
+            temp_path = f.name
+
+        with open(temp_path, 'rb') as doc:
+            send_document_safe(
+                message.chat.id,
+                doc,
+                visible_file_name="top5_quick_picks.txt",
+                caption=(
+                    f"⚡ <b>Quick Picks - Top 5 Countries</b>\n"
+                    f"{picks_line}\n\n"
+                    f"🔗 Channel: {CHANNEL_ID}"
+                ),
+                parse_mode="HTML"
+            )
+        os.unlink(temp_path)
+    except Exception as e:
+        logger.warning("Failed to send quick picks: %s", e)
+        bot.reply_to(message, "⚠️ Couldn't send the quick picks file. Try again shortly.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("country:"))
