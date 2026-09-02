@@ -448,60 +448,55 @@ def build_top_picks():
 
 
 # --- SAFE TELEGRAM SENDERS (Markdown/HTML parse errors and 429 flood waits) ---
-def send_message_safe(chat_id, text, **kwargs):
-    """Send a text message; on parse-mode errors retry plain, on 429 wait as long as Telegram asks."""
-    for attempt in range(3):
+def extract_retry_after(e):
+    """Pull retry_after out of an ApiTelegramException, tolerating library version differences."""
+    payload = getattr(e, "result_json", None) or {}
+    parameters = payload.get("parameters") or {}
+    retry_after = parameters.get("retry_after")
+    if retry_after:
         try:
-            return bot.send_message(chat_id, text, **kwargs)
+            return int(retry_after)
+        except (TypeError, ValueError):
+            pass
+    # last resort: parse "retry after N" from the human-readable description
+    m = re.search(r"retry after (\d+)", str(e), re.IGNORECASE)
+    return int(m.group(1)) if m else 0
+
+
+def safe_api_call(func, *args, **kwargs):
+    """Call a Telegram API method; on 429 sleep exactly as long as Telegram asks,
+    on parse errors retry without parse_mode. Never gives up on flood waits."""
+    flood_waits = 0
+    while True:
+        try:
+            return func(*args, **kwargs)
         except ApiTelegramException as e:
-            retry_after = getattr(e, "result_payload", {}).get("parameters", {}).get("retry_after")
+            retry_after = extract_retry_after(e)
             if retry_after:
-                logger.warning("Flood limit hit, waiting %ds (attempt %d)", retry_after, attempt + 1)
+                flood_waits += 1
+                logger.warning("Flood limit hit, waiting %ds (wait #%d)", retry_after, flood_waits)
                 time.sleep(retry_after + 1)
-                continue
-            if "parse" in str(e).lower():
+                continue  # flood waits are always retried, never counted against attempts
+            if "parse" in str(e).lower() or "can't parse" in str(e).lower():
                 logger.warning("Parse error, retrying without parse_mode: %s", e)
                 kwargs.pop("parse_mode", None)
-                kwargs.pop("reply_markup", None)
                 continue
             raise
-    raise RuntimeError("send_message_safe: retries exhausted")
+
+
+def send_message_safe(chat_id, text, **kwargs):
+    """Send a text message; flood-wait aware, parse-error fallback."""
+    return safe_api_call(bot.send_message, chat_id, text, **kwargs)
 
 
 def send_document_safe(chat_id, doc, **kwargs):
-    """Send a document; on 429 wait as long as Telegram asks, then retry."""
-    for attempt in range(3):
-        try:
-            return bot.send_document(chat_id, doc, **kwargs)
-        except ApiTelegramException as e:
-            retry_after = getattr(e, "result_payload", {}).get("parameters", {}).get("retry_after")
-            if retry_after:
-                logger.warning("Flood limit hit, waiting %ds (attempt %d)", retry_after, attempt + 1)
-                time.sleep(retry_after + 1)
-                continue
-            if "parse" in str(e).lower():
-                kwargs.pop("parse_mode", None)
-                continue
-            raise
-    raise RuntimeError("send_document_safe: retries exhausted")
+    """Send a document; flood-wait aware, parse-error fallback."""
+    return safe_api_call(bot.send_document, chat_id, doc, **kwargs)
 
 
 def send_photo_safe(chat_id, photo, **kwargs):
-    """Send a photo; on 429 wait as long as Telegram asks, then retry."""
-    for attempt in range(3):
-        try:
-            return bot.send_photo(chat_id, photo, **kwargs)
-        except ApiTelegramException as e:
-            retry_after = getattr(e, "result_payload", {}).get("parameters", {}).get("retry_after")
-            if retry_after:
-                logger.warning("Flood limit hit, waiting %ds (attempt %d)", retry_after, attempt + 1)
-                time.sleep(retry_after + 1)
-                continue
-            if "parse" in str(e).lower():
-                kwargs.pop("parse_mode", None)
-                continue
-            raise
-    raise RuntimeError("send_photo_safe: retries exhausted")
+    """Send a photo; flood-wait aware, parse-error fallback."""
+    return safe_api_call(bot.send_photo, chat_id, photo, **kwargs)
 
 
 def post_to_channel(country_name, configs):
@@ -615,7 +610,7 @@ def post_all_countries_to_channel():
         if lines and country_name != "Others":
             if post_to_channel(country_name, lines):
                 posted += 1
-                time.sleep(1)  # stay comfortably under the ~1 msg/sec channel limit
+                time.sleep(3.5)  # Telegram channels allow ~20 msgs/min; 3.5s keeps us under it
 
     try:
         banner_path = create_update_banner()
