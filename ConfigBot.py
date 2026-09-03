@@ -11,6 +11,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -309,7 +310,11 @@ def rebrand_config(config_line, country_key, index):
 
         elif any(config_line.startswith(p) for p in ["vless://", "ss://", "trojan://"]):
             base_part = config_line.split("#")[0]
-            return f"{base_part}#{new_remark}"
+            # The remark is a URI fragment: v2ray-style clients (v2rayNG etc.)
+            # parse these links with strict java.net.URI, which rejects a second
+            # '#' or any illegal character and silently drops the whole line on
+            # import. Percent-encode the remark so every client accepts it.
+            return f"{base_part}#{quote(new_remark, safe='')}"
     except Exception:
         pass
     return config_line
