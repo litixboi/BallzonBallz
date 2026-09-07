@@ -1,5 +1,6 @@
 pyTelegramBotAPI==4.22.0
 requests==2.32.3
+PySocks==1.7.1
 python-dotenv==1.0.1
 geoip2==4.8.0
 Pillow==10.4.0

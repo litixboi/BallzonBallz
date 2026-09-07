@@ -1,17 +1,20 @@
 import base64
 import html
+import itertools
 import json
 import logging
 import os
 import random
 import re
 import socket
+import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, unquote
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -177,6 +180,7 @@ UPDATE_INTERVAL = 2 * 60 * 60  # 2 hours, aligned to even UTC hour boundaries
 STATE_PATH = script_dir / "bot_state.json"
 TOP_PICKS_COUNTRIES = 5      # quick-picks file covers the countries with the most live configs
 TOP_PICKS_PER_COUNTRY = 50   # random picks per top country, never two on the same address
+NODE_TEST_WORKERS = 12       # concurrent Xray instances (each ~20MB RAM; ~300MB peak)
 
 
 # --- STATE PERSISTENCE (survives process restarts) ---
@@ -232,6 +236,411 @@ def prune_offsets():
             logger.info("Pruned %d stale user rotation entries", excess)
 
 
+# --- REAL NODE VERIFICATION (Xray-core SOCKS handshake) ---
+# An open TCP port says nothing: Cloudflare-fronted addresses, honeypots and
+# half-dead nodes all accept connections. To know a config actually proxies
+# traffic we run it through the real Xray-core binary as a local SOCKS proxy
+# and fetch a connectivity-check URL through it - the same path a real
+# client takes. Nodes that cannot carry an HTTP request are dropped.
+
+XRAY_DIR = script_dir / "xray_bin"
+XRAY_VERSION_FALLBACK = "v26.7.28"  # known-good release if 'latest' lookup fails
+CONNECTIVITY_URLS = ["http://cp.cloudflare.com/generate_204", "http://www.gstatic.com/generate_204"]
+SOCKS_PORT_RANGE = itertools.count(10001)
+_socks_ports_lock = threading.Lock()
+_xray_setup_lock = threading.Lock()
+_xray_ready = False
+XRAY_EXE = None  # set by ensure_xray_binary(); None = degraded TCP-only mode
+
+
+def next_socks_port():
+    """Hand out a unique local port for one verifier's SOCKS inbound."""
+    with _socks_ports_lock:
+        return next(SOCKS_PORT_RANGE)
+
+
+def ensure_xray_binary():
+    """Download + cache the Xray-core binary once per cold start.
+
+    Returns the path to the executable, or None when download/extract/exec
+    failed (caller then falls back to the plain TCP check).
+    """
+    global XRAY_EXE, _xray_ready
+    exe_name = "xray.exe" if os.name == "nt" else "xray"
+    exe_path = XRAY_DIR / exe_name
+    if exe_path.exists():
+        _xray_ready = True
+        XRAY_EXE = exe_path
+        return exe_path
+
+    with _xray_setup_lock:
+        if exe_path.exists():
+            _xray_ready = True
+            XRAY_EXE = exe_path
+            return exe_path
+        try:
+            XRAY_DIR.mkdir(parents=True, exist_ok=True)
+            # resolve the latest stable release tag (pre-releases excluded)
+            tag = XRAY_VERSION_FALLBACK
+            try:
+                api = http_get("https://api.github.com/repos/XTLS/Xray-core/releases/latest",
+                               timeout=10)
+                if api.status_code == 200:
+                    tag = api.json().get("tag_name") or tag
+            except Exception:
+                pass
+            asset = "Xray-windows-64.zip" if os.name == "nt" else "Xray-linux-64.zip"
+            zip_path = XRAY_DIR / "xray.zip"
+            res = http_get(f"https://github.com/XTLS/Xray-core/releases/download/{tag}/{asset}",
+                           timeout=120)
+            if res.status_code != 200:
+                raise RuntimeError(f"download HTTP {res.status_code}")
+            zip_path.write_bytes(res.content)
+            with zipfile.ZipFile(zip_path) as zf:
+                member = exe_name if exe_name in zf.namelist() else zf.namelist()[0]
+                zf.extract(member, XRAY_DIR)
+                if member != exe_name:
+                    (XRAY_DIR / member).rename(exe_path)
+                if "geoip.dat" in zf.namelist():
+                    zf.extract("geoip.dat", XRAY_DIR)
+            zip_path.unlink()
+            if os.name != "nt":
+                exe_path.chmod(0o755)
+            # sanity check: binary must run and report a version
+            out = subprocess.run([str(exe_path), "version"], capture_output=True, timeout=15)
+            if out.returncode != 0:
+                raise RuntimeError("xray version check failed")
+            _xray_ready = True
+            XRAY_EXE = exe_path
+            logger.info("Xray-core binary ready at %s (tag %s)", exe_path, tag)
+            return exe_path
+        except Exception as e:
+            logger.warning("Xray binary setup failed (%s) - falling back to TCP-only checks", e)
+            return None
+
+
+def _b64pad(data):
+    """Standard-pad base64 of any variant (also handles urlsafe alphabets)."""
+    data = data.replace("-", "+").replace("_", "/")
+    return data + "=" * ((4 - len(data) % 4) % 4)
+
+
+def parse_host_port(hostport):
+    """Parse 'host:port' or '[v6]:port'. Returns (host, port) or (None, None)."""
+    hostport = hostport.strip()
+    if hostport.startswith("["):
+        end = hostport.find("]")
+        if end < 0:
+            return None, None
+        host, rest = hostport[1:end], hostport[end + 1:]
+        if not rest.startswith(":"):
+            return None, None
+        port = rest[1:]
+    else:
+        if ":" not in hostport:
+            return None, None
+        host, port = hostport.rsplit(":", 1)
+    try:
+        return host, int(port)
+    except ValueError:
+        return None, None
+
+
+def parse_vmess_to_outbound(line):
+    """vmess://<base64 JSON> -> Xray outbound dict, or None if unusable."""
+    try:
+        data = json.loads(base64.b64decode(_b64pad(line[8:])).decode("utf-8"))
+        if not isinstance(data, dict):
+            return None
+        address = str(data.get("add") or "").strip()
+        if not address or not str(data.get("id") or "").strip():
+            return None
+        port = int(data.get("port"))
+        if not (0 < port < 65536):
+            return None
+        net = str(data.get("net") or "tcp").lower()
+        if net == "http":
+            net = "h2"
+        security = str(data.get("tls") or "").lower()
+        stream = {"network": net, "security": "none"}
+        if security in ("tls", "reality"):
+            stream["security"] = "tls"
+            sni = str(data.get("sni") or data.get("host") or "").strip()
+            if sni:
+                stream["tlsSettings"] = {"serverName": sni}
+            fp = str(data.get("fp") or "").strip()
+            if fp:
+                stream["tlsSettings"]["fingerprint"] = fp
+        if net == "ws":
+            ws = {"path": str(data.get("path") or "/")}
+            host_header = str(data.get("host") or "").strip()
+            if host_header:
+                ws["headers"] = {"Host": host_header}
+            stream["wsSettings"] = ws
+        elif net == "h2":
+            h2 = {"path": str(data.get("path") or "/")}
+            host_header = str(data.get("host") or "").strip()
+            if host_header:
+                h2["host"] = [host_header]
+            stream["httpSettings"] = h2
+        elif net == "grpc":
+            stream["grpcSettings"] = {"serviceName": str(data.get("path") or "")}
+        elif net == "httpupgrade":
+            stream["httpupgradeSettings"] = {"path": str(data.get("path") or "/")}
+
+        return {
+            "tag": "test",
+            "protocol": "vmess",
+            "settings": {
+                "vnext": [{
+                    "address": address,
+                    "port": port,
+                    "users": [{"id": str(data.get("id")), "alterId": int(data.get("aid") or 0)}],
+                }],
+            },
+            "streamSettings": stream,
+        }
+    except Exception:
+        return None
+
+
+def parse_vless_trojan_to_outbound(line, proto):
+    """vless:// or trojan:// URI -> Xray outbound dict, or None if unusable."""
+    try:
+        rest = unquote(line.split("://", 1)[1])
+        if "#" in rest:
+            rest = rest.split("#", 1)[0]  # strip remark/fragment
+        hostpart = rest.split("@", 1)[1] if "@" in rest else rest
+        hostpart = hostpart.split("?", 1)[0]
+        host, port = parse_host_port(hostpart)
+        if not host or port is None:
+            return None
+        userinfo = rest.split("@", 1)[0]
+        if not userinfo:
+            return None
+        params = parse_qs(rest.split("?", 1)[1]) if "?" in rest else {}
+        params = {k.lower(): v[-1] for k, v in params.items()}
+
+        net = (params.get("type") or "tcp").lower()
+        if net == "http":
+            net = "h2"
+        security = (params.get("security") or "none").lower()
+        stream = {"network": net, "security": "none"}
+        if security in ("tls", "reality"):
+            stream["security"] = "tls"
+            tls = {"serverName": params.get("sni") or host}
+            if params.get("fp"):
+                tls["fingerprint"] = params.get("fp")
+            if security == "reality":
+                if not params.get("pbk") or not params.get("sid"):
+                    return None  # reality without keys can't work
+                tls["realitySettings"] = {
+                    "show": False,
+                    "fingerprint": params.get("fp") or "chrome",
+                    "serverName": params.get("sni") or host,
+                    "publicKey": params.get("pbk"),
+                    "shortId": params.get("sid") or "",
+                    "spiderX": params.get("spx") or "",
+                }
+            stream["tlsSettings"] = tls
+        if net == "ws":
+            ws = {"path": unquote(params.get("path") or "/")}
+            if params.get("host"):
+                ws["headers"] = {"Host": params.get("host")}
+            stream["wsSettings"] = ws
+        elif net == "h2":
+            h2 = {"path": unquote(params.get("path") or "/")}
+            if params.get("realIP") or params.get("host"):
+                h2["host"] = [params.get("realIP") or params.get("host")]
+            stream["httpSettings"] = h2
+        elif net == "grpc":
+            stream["grpcSettings"] = {"serviceName": unquote(params.get("serviceName") or "")}
+        elif net == "httpupgrade":
+            stream["httpupgradeSettings"] = {"path": unquote(params.get("path") or "/")}
+
+        if proto == "vless":
+            return {
+                "tag": "test",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": host,
+                        "port": port,
+                        "users": [{
+                            "id": userinfo,
+                            "encryption": "none",
+                            "flow": params.get("flow") or "",
+                        }],
+                    }],
+                },
+                "streamSettings": stream,
+            }
+        return {
+            "tag": "trojan",
+            "protocol": "trojan",
+            "settings": {
+                "servers": [{
+                    "address": host,
+                    "port": port,
+                    "password": unquote(userinfo),
+                }],
+            },
+            "streamSettings": stream,
+        }
+    except Exception:
+        return None
+
+
+def parse_ss_to_outbound(line):
+    """ss:// URI (plain or legacy whole-payload base64) -> Xray outbound, or None."""
+    try:
+        rest = line.split("://", 1)[1]
+        if "#" in rest:
+            rest = rest.split("#", 1)[0]  # strip remark/fragment
+        if "@" in rest:
+            userinfo, hostport = rest.rsplit("@", 1)
+            hostport = hostport.split("?", 1)[0]
+            host, port = parse_host_port(hostport)
+            if not host or port is None:
+                return None
+            if ":" in userinfo:
+                method, password = userinfo.split(":", 1)
+                method, password = unquote(method), unquote(password)
+            else:
+                decoded = base64.b64decode(_b64pad(unquote(userinfo))).decode("utf-8")
+                method, password = decoded.split(":", 1)
+        else:
+            # legacy: whole payload after ss:// is base64(method:password@host:port)
+            decoded = base64.b64decode(_b64pad(rest.split("?", 1)[0])).decode("utf-8")
+            if "@" not in decoded:
+                return None
+            userinfo, hostport = decoded.rsplit("@", 1)
+            if ":" not in userinfo:
+                return None
+            method, password = userinfo.split(":", 1)
+            host, port = parse_host_port(hostport)
+            if not host or port is None:
+                return None
+        method = method.strip()
+        if not method or not password:
+            return None
+        if "plugin=" in line:
+            return None  # obfs plugins (simple-obfs, v2ray-plugin) aren't supported by Xray
+        return {
+            "tag": "test",
+            "protocol": "shadowsocks",
+            "settings": {
+                "servers": [{
+                    "address": host,
+                    "port": port,
+                    "method": method,
+                    "password": password,
+                }],
+            },
+            "streamSettings": {"network": "tcp", "security": "none"},
+        }
+    except Exception:
+        return None
+
+
+def parse_config_to_outbound(line):
+    scheme = line.split("://", 1)[0].lower()
+    if scheme == "vmess":
+        return parse_vmess_to_outbound(line)
+    if scheme == "vless":
+        return parse_vless_trojan_to_outbound(line, "vless")
+    if scheme == "trojan":
+        return parse_vless_trojan_to_outbound(line, "trojan")
+    if scheme == "ss":
+        return parse_ss_to_outbound(line)
+    return None
+
+
+def verify_node(line):
+    """Run one config through real Xray-core and fetch a URL through it.
+
+    Returns (ok: bool, latency_ms: int | None); (False, None) = untestable line.
+    """
+    outbound = parse_config_to_outbound(line)
+    if outbound is None:
+        return False, None
+    exe = XRAY_EXE or ensure_xray_binary()
+    if exe is None:
+        # degraded mode: binary unavailable, fall back to TCP connect only
+        host, port = extract_host_and_port(line)
+        if not host or not port:
+            return False, None
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2.0)
+                s.connect((host, port))
+                return True, None
+        except Exception:
+            return False, None
+
+    port = next_socks_port()
+    test_cfg = {
+        "log": {"loglevel": "error"},
+        "inbounds": [{
+            "tag": "in0",
+            "listen": "127.0.0.1",
+            "port": port,
+            "protocol": "socks",
+            "settings": {"auth": "noauth", "udp": False},
+        }],
+        "outbounds": [outbound, {"tag": "direct", "protocol": "freedom"}],
+        "routing": {"rules": [{"type": "field", "inboundTag": ["in0"], "outboundTag": "test"}]},
+    }
+    cfg_path = None
+    proc = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                          encoding="utf-8", dir=str(XRAY_DIR)) as f:
+            json.dump(test_cfg, f)
+            cfg_path = Path(f.name)
+        proc = subprocess.Popen([str(exe), "run", "-c", str(cfg_path)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # wait for the SOCKS port to come up (xray binds almost instantly)
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            return False, None
+        start = time.monotonic()
+        for url in CONNECTIVITY_URLS:
+            try:
+                res = requests.get(url, proxies={
+                    "http": f"socks5h://127.0.0.1:{port}",
+                    "https": f"socks5h://127.0.0.1:{port}",
+                }, timeout=(5, 5))
+                # 2xx/3xx through the tunnel = the node really proxies traffic.
+                # Any other status means the tunnel itself is alive but the
+                # exit rejected the request - keep trying the other URLs.
+                if res.status_code < 300:
+                    return True, int((time.monotonic() - start) * 1000)
+            except Exception:
+                continue
+        return False, None
+    except Exception:
+        return False, None
+    finally:
+        if proc is not None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        if cfg_path is not None:
+            try:
+                cfg_path.unlink()
+            except OSError:
+                pass
+
+
 # --- UTILITY PARSING AND TESTING PIPELINES ---
 def extract_host_and_port(config_line):
     try:
@@ -273,26 +682,25 @@ def node_key(config_line):
 
 
 def test_single_node(line):
+    """Real end-to-end verification: Xray-core SOCKS handshake + HTTP fetch.
+    Falls back to the old TCP-connect check only when the binary is unavailable."""
     host, port = extract_host_and_port(line)
     if not host or not port:
         return None
 
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2.0)
-            s.connect((host, port))
-
-        country_name = get_country_local(host)
-
-        assigned_bucket = "Others"
-        for bot_button, full_country_name in BUTTON_TO_COUNTRY.items():
-            if country_name == full_country_name:
-                assigned_bucket = bot_button
-                break
-
-        return {"bucket": assigned_bucket, "raw_line": line}
-    except (socket.timeout, socket.error):
+    ok, latency = verify_node(line)
+    if not ok:
         return None
+
+    country_name = get_country_local(host)
+
+    assigned_bucket = "Others"
+    for bot_button, full_country_name in BUTTON_TO_COUNTRY.items():
+        if country_name == full_country_name:
+            assigned_bucket = bot_button
+            break
+
+    return {"bucket": assigned_bucket, "raw_line": line, "latency": latency}
 
 
 def rebrand_config(config_line, country_key, index):
@@ -726,13 +1134,16 @@ def update_configs_loop():
         logger.info("Discovered %d original nodes. Launching multi-threaded pipeline...", len(unique_original))
 
         active_found = 0
-        with ThreadPoolExecutor(max_workers=70) as executor:
+        latency_map = {}  # node_key -> measured latency_ms
+        with ThreadPoolExecutor(max_workers=NODE_TEST_WORKERS) as executor:
             futures = [executor.submit(test_single_node, line) for line in unique_original]
             for future in as_completed(futures):
                 result = future.result()
                 if result:
                     active_found += 1
                     temp_storage[result["bucket"]].append(result["raw_line"])
+                    if result.get("latency") is not None:
+                        latency_map[node_key(result["raw_line"])] = result["latency"]
 
         # 4. Au1rxx configs: already country-sorted, test connectivity + dedup against everything above
         logger.info("Testing Au1rxx pre-sorted configs...")
@@ -747,13 +1158,15 @@ def update_configs_loop():
                 bucket_lines.append(line)
             if not bucket_lines:
                 continue
-            with ThreadPoolExecutor(max_workers=30) as executor:
+            with ThreadPoolExecutor(max_workers=NODE_TEST_WORKERS) as executor:
                 futures = [executor.submit(test_single_node, line) for line in bucket_lines]
                 for future in as_completed(futures):
                     result = future.result()
                     if result:
                         active_found += 1
                         temp_storage[country_name].append(result["raw_line"])
+                        if result.get("latency") is not None:
+                            latency_map[node_key(result["raw_line"])] = result["latency"]
 
         total_found = sum(len(v) for v in temp_storage.values())
 
@@ -764,7 +1177,17 @@ def update_configs_loop():
             time.sleep(120)
             continue
 
-        # 6. Rebrand all configs
+        # 6. Sort each bucket fastest-first (verified nodes with no latency keep their order)
+        for bucket, lines in temp_storage.items():
+            temp_storage[bucket] = sorted(
+                lines,
+                key=lambda l: (
+                    latency_map.get(node_key(l)) is None,  # measured nodes first
+                    latency_map.get(node_key(l)) or 10**9,
+                ),
+            )
+
+        # Rebrand all configs
         for bucket, lines in temp_storage.items():
             country_data_key = BUTTON_TO_COUNTRY[bucket]
             temp_storage[bucket] = [rebrand_config(line, country_data_key, idx) for idx, line in enumerate(lines, 1)]
