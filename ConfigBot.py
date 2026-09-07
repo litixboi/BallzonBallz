@@ -244,7 +244,13 @@ def prune_offsets():
 # client takes. Nodes that cannot carry an HTTP request are dropped.
 
 XRAY_DIR = script_dir / "xray_bin"
-XRAY_VERSION_FALLBACK = "v26.7.28"  # known-good release if 'latest' lookup fails
+XRAY_VERSION_FALLBACK = "v26.3.27"  # known-good STABLE release if 'latest' lookup fails
+XRAY_DL_PREFIXES = [  # tried in order; mirrors dodge GitHub rate-limits on shared egress IPs
+    "https://github.com/",
+    "https://ghproxy.net/https://github.com/",
+    "https://gh-proxy.com/https://github.com/",
+]
+XRAY_SETUP_FAILED_UNTIL = 0.0  # monotonic time before which binary setup is skipped (negative cache)
 CONNECTIVITY_URLS = ["http://cp.cloudflare.com/generate_204", "http://www.gstatic.com/generate_204"]
 SOCKS_PORT_RANGE = itertools.count(10001)
 _socks_ports_lock = threading.Lock()
@@ -262,10 +268,11 @@ def next_socks_port():
 def ensure_xray_binary():
     """Download + cache the Xray-core binary once per cold start.
 
-    Returns the path to the executable, or None when download/extract/exec
-    failed (caller then falls back to the plain TCP check).
+    Returns the path to the executable, or None when setup failed. Failed
+    setups are remembered for 10 minutes (negative cache) so ~4000 worker
+    threads don't each re-attempt a 20 MB download in the same scan.
     """
-    global XRAY_EXE, _xray_ready
+    global XRAY_EXE, _xray_ready, XRAY_SETUP_FAILED_UNTIL
     exe_name = "xray.exe" if os.name == "nt" else "xray"
     exe_path = XRAY_DIR / exe_name
     if exe_path.exists():
@@ -273,11 +280,17 @@ def ensure_xray_binary():
         XRAY_EXE = exe_path
         return exe_path
 
+    now = time.monotonic()
+    if now < XRAY_SETUP_FAILED_UNTIL:
+        return None  # recently failed; don't hammer the download again this scan
+
     with _xray_setup_lock:
         if exe_path.exists():
             _xray_ready = True
             XRAY_EXE = exe_path
             return exe_path
+        if time.monotonic() < XRAY_SETUP_FAILED_UNTIL:
+            return None
         try:
             XRAY_DIR.mkdir(parents=True, exist_ok=True)
             # resolve the latest stable release tag (pre-releases excluded)
@@ -286,16 +299,28 @@ def ensure_xray_binary():
                 api = http_get("https://api.github.com/repos/XTLS/Xray-core/releases/latest",
                                timeout=10)
                 if api.status_code == 200:
-                    tag = api.json().get("tag_name") or tag
+                    latest = api.json().get("tag_name")
+                    if latest and not api.json().get("prerelease"):
+                        tag = latest
             except Exception:
                 pass
             asset = "Xray-windows-64.zip" if os.name == "nt" else "Xray-linux-64.zip"
             zip_path = XRAY_DIR / "xray.zip"
-            res = http_get(f"https://github.com/XTLS/Xray-core/releases/download/{tag}/{asset}",
-                           timeout=120)
-            if res.status_code != 200:
-                raise RuntimeError(f"download HTTP {res.status_code}")
-            zip_path.write_bytes(res.content)
+            dl_errors = []
+            content = None
+            for prefix in XRAY_DL_PREFIXES:
+                try:
+                    res = http_session.get(f"{prefix}XTLS/Xray-core/releases/download/{tag}/{asset}",
+                                           timeout=180)
+                    if res.status_code == 200 and len(res.content) > 1_000_000:
+                        content = res.content
+                        break
+                    dl_errors.append(f"{prefix} HTTP {res.status_code}")
+                except Exception as e:
+                    dl_errors.append(f"{prefix} {type(e).__name__}")
+            if content is None:
+                raise RuntimeError("download failed: " + "; ".join(dl_errors))
+            zip_path.write_bytes(content)
             with zipfile.ZipFile(zip_path) as zf:
                 member = exe_name if exe_name in zf.namelist() else zf.namelist()[0]
                 zf.extract(member, XRAY_DIR)
@@ -315,7 +340,9 @@ def ensure_xray_binary():
             logger.info("Xray-core binary ready at %s (tag %s)", exe_path, tag)
             return exe_path
         except Exception as e:
-            logger.warning("Xray binary setup failed (%s) - falling back to TCP-only checks", e)
+            XRAY_SETUP_FAILED_UNTIL = time.monotonic() + 600  # retry in 10 minutes
+            logger.warning("Xray binary setup failed (%s) - node verification degraded until %s",
+                           e, time.strftime("%H:%M:%S", time.localtime(time.time() + 600)))
             return None
 
 
@@ -566,17 +593,28 @@ def verify_node(line):
         return False, None
     exe = XRAY_EXE or ensure_xray_binary()
     if exe is None:
-        # degraded mode: binary unavailable, fall back to TCP connect only
-        host, port = extract_host_and_port(line)
-        if not host or not port:
-            return False, None
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(2.0)
-                s.connect((host, port))
-                return True, None
-        except Exception:
-            return False, None
+        # binary unavailable and this worker was reached anyway: nothing trustworthy
+        # can be said about the node; the scan loop already refused to publish.
+        return False, None
+
+    # Cheap pre-gate: if the TCP port is closed there is no point spawning a
+    # whole Xray instance just to watch it time out. Costs 2s max instead of 10-15s.
+    # Pull address/port straight from the parsed outbound (same authority the
+    # test config uses) - avoids the legacy regex that breaks on IPv6.
+    try:
+        if outbound.get("protocol") in ("vmess", "vless"):
+            host = outbound["settings"]["vnext"][0]["address"]
+            port = int(outbound["settings"]["vnext"][0]["port"])
+        else:
+            host = outbound["settings"]["servers"][0]["address"]
+            port = int(outbound["settings"]["servers"][0]["port"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False, None
+    try:
+        with socket.create_connection((host, port), timeout=2.0):
+            pass
+    except OSError:
+        return False, None
 
     port = next_socks_port()
     test_cfg = {
@@ -1133,6 +1171,16 @@ def update_configs_loop():
 
         logger.info("Discovered %d original nodes. Launching multi-threaded pipeline...", len(unique_original))
 
+        # End-to-end verification requires the Xray binary; without it a scan
+        # can only produce TCP-open-but-dead nodes. Skip the whole sweep instead
+        # of publishing garbage - previous cache stays live until next attempt.
+        exe = ensure_xray_binary()
+        if exe is None:
+            logger.warning("Xray binary unavailable - SKIPPING scan (previous cache kept, %d configs). "
+                           "Retry in 10 min.", sum(len(v) for v in categorized_nodes.values()))
+            time.sleep(600)
+            continue
+
         active_found = 0
         latency_map = {}  # node_key -> measured latency_ms
         with ThreadPoolExecutor(max_workers=NODE_TEST_WORKERS) as executor:
@@ -1238,6 +1286,8 @@ def build_country_inline_keyboard():
 def send_welcome(message):
     countries = [c for c in BUTTON_TO_COUNTRY.keys() if c != "Others"]
     last_line = f"🕒 Last update: {last_update_time}" if last_update_time else "🕒 First scan still in progress..."
+    verify_line = ("✅ End-to-end verified (real Xray-core handshakes)"
+                   if _xray_ready else "⚠️ Verifier degraded - Xray binary unavailable, cache may be stale")
 
     bot.reply_to(
         message,
@@ -1247,7 +1297,7 @@ def send_welcome(message):
         f"⚡ Short on time? Send <b>/top</b> for a small file with 50 diverse configs from each of the "
         f"top 5 countries.\n"
         f"📊 Send <b>/status</b> to see live counts per country.\n\n"
-        f"{last_line}\n"
+        f"{last_line}\n{verify_line}\n"
         f"🔗 Channel: {CHANNEL_ID}",
         reply_markup=build_country_inline_keyboard(),
         parse_mode="HTML"
@@ -1275,9 +1325,11 @@ def send_status(message):
         body = "\n".join(lines)
 
     last_line = f"🕒 Last update: {last_update_time}" if last_update_time else "🕒 First scan still in progress..."
+    verify_line = ("✅ End-to-end verified (real Xray-core handshakes)"
+                   if _xray_ready else "⚠️ Verifier degraded - Xray binary unavailable, cache may be stale")
     bot.reply_to(
         message,
-        f"📊 <b>Current Cache Status</b>\n\n{body}\n\n📦 Total: {total} configs\n{last_line}\n🔗 Channel: {CHANNEL_ID}",
+        f"📊 <b>Current Cache Status</b>\n\n{body}\n\n📦 Total: {total} configs\n{last_line}\n{verify_line}\n🔗 Channel: {CHANNEL_ID}",
         parse_mode="HTML"
     )
 
@@ -1428,6 +1480,8 @@ if __name__ == "__main__":
     updater_thread.start()
 
     logger.info("Resilient Telegram operational routing loop initializing...")
+    # surface verifier state right away so a degraded deploy is visible in logs
+    threading.Thread(target=ensure_xray_binary, daemon=True).start()
     while True:
         try:
             logger.info("Starting Telegram bot polling...")
