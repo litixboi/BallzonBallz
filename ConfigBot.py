@@ -1503,17 +1503,108 @@ def show_buy_menu(chat_id, message_id=None):
         send_message_safe(chat_id, "⚠️ در حال حاضر هیچ پلنی فعال نیست. لطفاً بعداً مراجعه فرمایید.")
         return
 
+    available_devices = sorted(list(set(p.get("devices", 1) for p in plans)))
+    device_names = {
+        1: "👤 پلن‌های ۱ کاربره (تک کاربره)",
+        2: "👥 پلن‌های ۲ کاربره (دو کاربره)",
+        3: "👨‍👩‍👧 پلن‌های ۳ کاربره (سه کاربره)",
+        4: "👨‍👩‍👦‍👦 پلن‌های ۴ کاربره (چهار کاربره)",
+        5: "🏢 پلن‌های ۵ کاربره (پنج کاربره / تیمی)",
+    }
+
     text = (
-        "💎 <b>پلن‌های اشتراک اختصاصی و پرسرعت VIP:</b>\n\n"
-        "تمامی کانفیگ‌های VIP بر بستر سرورهای اختصاصی با پروتکل امن VLESS+WS+TLS ارائه می‌شوند. "
-        "قابلیت فرگمنت اختصاصی روی خطوط همراه اول و ایرانسل تضمین شده است.\n\n"
-        "👇 <i>برای مشاهده جزئیات قیمت آنلاین و انتخاب روش پرداخت، پلن مورد نظر خود را لمس کنید:</i>"
+        "💎 <b>خرید اشتراک اختصاصی و فوق پرسرعت VIP:</b>\n\n"
+        "▫️ سرورهای اختصاصی تانل با پینگ بسیار پایین و پایدار\n"
+        "▫️ مجهز به تکنولوژی ضد فیلتر و TLS Fragmentation (همراه اول، ایرانسل، رایتل و نت خانگی)\n"
+        "▫️ آی‌پی تمیز و ثابت، مناسب ترید، صرافی‌های بین‌المللی و هوش مصنوعی\n"
+        "▫️ ارائه در دوره‌های ۱ ماهه، ۳ ماهه و ۶ ماهه (از ۱۰ تا ۲۰۰ گیگابایت)\n\n"
+        "👇 <i>لطفاً دسته اشتراک مورد نظر خود را بر اساس تعداد دستگاه/کاربر انتخاب فرمایید:</i>"
     )
     markup = types.InlineKeyboardMarkup(row_width=1)
-    for p in plans:
-        btn_title = f"⚡ {p['name_fa']} - ${p['price_usd']:.2f} USD ({p['volume_gb']}GB)"
-        markup.add(types.InlineKeyboardButton(btn_title, callback_data=f"plan_sel:{p['id']}"))
+    for dev in available_devices:
+        title = device_names.get(dev, f"👥 پلن‌های {dev} کاربره")
+        markup.add(types.InlineKeyboardButton(title, callback_data=f"buy_cat:{dev}"))
     markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"))
+
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+def show_volume_menu(chat_id, devices: int, message_id=None):
+    plans = get_vip_plans()
+    matching_plans = [p for p in plans if p.get("devices", 1) == devices]
+    if not matching_plans:
+        send_message_safe(chat_id, "⚠️ پلنی برای این دسته‌بندی یافت نشد.")
+        return
+
+    volumes = sorted(list(set(p["volume_gb"] for p in matching_plans)))
+    device_titles = {
+        1: "۱ کاربره",
+        2: "۲ کاربره",
+        3: "۳ کاربره",
+        4: "۴ کاربره",
+        5: "۵ کاربره",
+    }
+    dev_str = device_titles.get(devices, f"{devices} کاربره")
+    text = (
+        f"⚡ <b>انتخاب حجم ترافیک (پلن‌های {dev_str}):</b>\n\n"
+        f"برای اشتراک‌های {dev_str}، حجم‌های زیر در دوره‌های ۱، ۳ و ۶ ماهه در دسترس هستند.\n\n"
+        f"👇 <i>لطفاً حجم ترافیک مورد نظر خود را انتخاب فرمایید:</i>"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    vol_buttons = []
+    for v in volumes:
+        label = f"▫️ {v} گیگابایت" if v != 200 else "▫️ ۲۰۰ گیگ (نامحدود)"
+        vol_buttons.append(types.InlineKeyboardButton(label, callback_data=f"buy_vol:{devices}:{v}"))
+
+    markup.add(*vol_buttons)
+    markup.row(types.InlineKeyboardButton("🔙 بازگشت به انتخاب تعداد کاربر", callback_data="menu:buy"))
+
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+def show_duration_menu(chat_id, devices: int, volume_gb: int, message_id=None):
+    plans = get_vip_plans()
+    matching_plans = [p for p in plans if p.get("devices", 1) == devices and p.get("volume_gb") == volume_gb]
+    if not matching_plans:
+        send_message_safe(chat_id, "⚠️ پلنی با این مشخصات یافت نشد.")
+        return
+
+    matching_plans.sort(key=lambda x: x.get("duration_days", 30))
+    dur_labels = {
+        30: "۱ ماهه",
+        90: "۳ ماهه",
+        180: "۶ ماهه",
+    }
+
+    vol_title = f"{volume_gb} گیگابایت" if volume_gb != 200 else "۲۰۰ گیگابایت (نامحدود)"
+    text = (
+        f"⚡ <b>انتخاب مدت زمان اشتراک:</b>\n\n"
+        f"▫️ <b>دسته‌بندی:</b> {devices} کاربره همزمان\n"
+        f"▫️ <b>حجم ترافیک:</b> {vol_title}\n\n"
+        f"👇 <i>مدت زمان اشتراک مورد نظر خود را انتخاب نمایید:</i>"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for p in matching_plans:
+        days = p.get("duration_days", 30)
+        dur_name = dur_labels.get(days, f"{days} روز")
+        toman = p.get("price_toman", 0)
+        usd = p.get("price_usd", 0.0)
+        btn_title = f"▫️ {dur_name}: {toman:,} تومان (~${usd:.0f} USD)"
+        markup.add(types.InlineKeyboardButton(btn_title, callback_data=f"plan_sel:{p['id']}"))
+
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به انتخاب حجم", callback_data=f"buy_cat:{devices}"))
 
     if message_id:
         try:
@@ -1903,6 +1994,28 @@ def handle_donate_qr(call):
     send_photo_safe(call.message.chat.id, qr_bytes, caption=caption, parse_mode="HTML", reply_markup=markup)
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("buy_cat:"))
+def handle_buy_cat_callback(call):
+    dev_str = call.data.split(":", 1)[1]
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    if dev_str.isdigit():
+        show_volume_menu(call.message.chat.id, int(dev_str), message_id=call.message.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("buy_vol:"))
+def handle_buy_vol_callback(call):
+    parts = call.data.split(":")
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+        show_duration_menu(call.message.chat.id, int(parts[1]), int(parts[2]), message_id=call.message.message_id)
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("plan_sel:"))
 def handle_plan_selection(call):
     plan_id = call.data.split(":", 1)[1]
@@ -1918,13 +2031,20 @@ def handle_plan_selection(call):
         return
 
     calc = crypto_manager.calculate_adaptive_prices(plan["price_usd"])
+    devices = plan.get("devices", 1)
+    volume_gb = plan.get("volume_gb", 30)
+    dur_days = plan.get("duration_days", 30)
+    dur_map = {30: "۱ ماهه", 90: "۳ ماهه", 180: "۶ ماهه"}
+    dur_str = dur_map.get(dur_days, f"{dur_days} روز")
+    toman_price = plan.get("price_toman", 0)
+
     text = (
-        f"💎 <b>جزئیات و انتخاب روش پرداخت برای {plan['name_fa']}:</b>\n\n"
-        f"▫️ <b>حجم ترافیک:</b> {plan['volume_gb']} گیگابایت\n"
-        f"▫️ <b>مدت اعتبار:</b> {plan['duration_days']} روز\n"
-        f"▫️ <b>تعداد کاربر همزمان:</b> {plan['devices']} دستگاه\n"
-        f"▫️ <b>مشخصات:</b> {plan.get('description_fa', '')}\n\n"
-        f"💰 <b>مبلغ قابل پرداخت (محاسبه آنلاین با نرخ لحظه‌ای بازار):</b>\n"
+        f"💎 <b>جزئیات و انتخاب روش پرداخت:</b>\n\n"
+        f"▫️ <b>تعداد کاربر همزمان:</b> {devices} کاربره\n"
+        f"▫️ <b>حجم ترافیک:</b> {volume_gb} گیگابایت\n"
+        f"▫️ <b>مدت اعتبار:</b> {dur_str} ({dur_days} روز)\n"
+        f"▫️ <b>مبلغ تومانی:</b> {toman_price:,} تومان\n\n"
+        f"💰 <b>مبلغ قابل پرداخت با رمزارز (نرخ لحظه‌ای بازار):</b>\n"
         f"💵 <b>معادل تتر (USDT):</b> ${calc['usdt']:.2f} USDT\n"
         f"🔺 <b>معادل ترون (TRX):</b> ~{calc['trx']} TRX\n"
         f"🔹 <b>معادل اتریوم (ETH):</b> ~{calc['eth']} ETH\n\n"
@@ -1932,9 +2052,9 @@ def handle_plan_selection(call):
     )
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton(f"🔺 پرداخت در شبکه ترون (TRX / USDT-TRC20)", callback_data=f"pay_net:{plan_id}:tron"),
-        types.InlineKeyboardButton(f"🔹 پرداخت در شبکه اتریوم (ETH / USDT-ERC20)", callback_data=f"pay_net:{plan_id}:eth"),
-        types.InlineKeyboardButton("🔙 بازگشت به لیست پلن‌ها", callback_data="menu:buy")
+        types.InlineKeyboardButton("🔺 پرداخت در شبکه ترون (TRX / USDT-TRC20)", callback_data=f"pay_net:{plan_id}:tron"),
+        types.InlineKeyboardButton("🔹 پرداخت در شبکه اتریوم (ETH / USDT-ERC20)", callback_data=f"pay_net:{plan_id}:eth"),
+        types.InlineKeyboardButton("🔙 بازگشت به انتخاب مدت زمان", callback_data=f"buy_vol:{devices}:{volume_gb}")
     )
     try:
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
@@ -1982,10 +2102,16 @@ def handle_payment_network(call):
         crypto_amount=crypto_amount,
     )
 
+    toman_price = plan.get("price_toman", 0)
+    dur_days = plan.get("duration_days", 30)
+    dur_map = {30: "۱ ماهه", 90: "۳ ماهه", 180: "۶ ماهه"}
+    dur_str = dur_map.get(dur_days, f"{dur_days} روز")
+
     qr_bytes = crypto_manager.generate_qr_bytes(wallet_address)
     caption = (
         f"🧾 <b>فاکتور پرداخت سفارش <code>{order_id}</code></b>\n\n"
-        f"📦 <b>پلن:</b> {plan['name_fa']} ({plan['volume_gb']}GB - {plan['duration_days']} روز)\n"
+        f"📦 <b>پلن:</b> {plan.get('volume_gb', 30)} گیگ | {dur_str} ({plan.get('devices', 1)} کاربره)\n"
+        f"💵 <b>مبلغ سفارش:</b> {toman_price:,} تومان (~${plan['price_usd']:.0f} USD)\n"
         f"🌐 <b>شبکه انتقال:</b> {net_title}\n"
         f"💰 <b>مبلغ قابل واریز:</b> {amount_str}\n\n"
         f"📍 <b>آدرس کیف پول جهت واریز:</b>\n"
@@ -1993,13 +2119,13 @@ def handle_payment_network(call):
         f"<i>(روی آدرس ضربه بزنید تا کپی شود)</i>\n\n"
         f"⚠️ <b>راهنمای تکمیل خرید:</b>\n"
         f"۱. مبلغ مشخص‌شده را به آدرس بالا انتقال دهید.\n"
-        f"۲. پس از انجام انتقال، دکمه <b>«ثبت کد پیگیری / رسید»</b> را بزنید و کد هش (TxID) یا عکس رسید را ارسال نمایید.\n"
+        f"۲. پس از انجام انتقال، دکمه <b>«ثبت رسید / شناسه تراکنش (TxID)»</b> را بزنید و کد هش (TxID) یا عکس رسید را ارسال نمایید.\n"
         f"۳. پس از تایید مدیریت، کانفیگ اختصاصی شما به صورت خودکار صادر خواهد شد."
     )
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("✅ ثبت رسید / شناسه تراکنش (TxID)", callback_data=f"submit_tx:{order_id}"),
-        types.InlineKeyboardButton("🔙 انصراف و بازگشت به پلن‌ها", callback_data="menu:buy")
+        types.InlineKeyboardButton("🔙 بازگشت به جزئیات پلن", callback_data=f"plan_sel:{plan_id}")
     )
     send_photo_safe(call.message.chat.id, qr_bytes, caption=caption, parse_mode="HTML", reply_markup=markup)
 
@@ -2068,7 +2194,7 @@ def handle_admin_decision(call):
     except Exception:
         pass
 
-    email_tag = f"tg_{order['user_id']}_{order_id.lower().replace('-', '_')}"
+    email_tag = f"tg_{order['user_id']}"
     creation_res = conpanel_mgr.create_customer_subscription(
         email=email_tag,
         total_gb=order["volume_gb"],

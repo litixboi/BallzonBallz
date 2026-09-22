@@ -73,6 +73,7 @@ class OrderManager:
                 "duration_days": plan.get("duration_days", 30),
                 "devices": plan.get("devices", 1),
                 "price_usd": plan.get("price_usd", 0.0),
+                "price_toman": plan.get("price_toman", 0),
                 "crypto_network": crypto_network,
                 "crypto_currency": crypto_currency,
                 "crypto_amount": crypto_amount,

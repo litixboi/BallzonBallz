@@ -97,6 +97,17 @@ class ConpanelClient:
         client_uuid = str(uuid.uuid4())
         sub_id = secrets.token_hex(8)  # 16-char hex
 
+        # Ensure naming is based on the buyer's Telegram ID
+        if tg_id:
+            base_email = f"tg_{tg_id}"
+            check = self.get_client(base_email)
+            if check:
+                email = f"tg_{tg_id}_{total_gb}GB_{secrets.token_hex(2)}"
+            else:
+                email = base_email
+        elif not email:
+            email = f"user_{sub_id[:8]}"
+
         now_ms = int(time.time() * 1000)
         expiry_ms = now_ms + int(expiry_days * 86400 * 1000)
         total_bytes = int(total_gb * 1024 * 1024 * 1024)
@@ -112,7 +123,7 @@ class ConpanelClient:
             "tgId": int(tg_id) if tg_id else 0,
             "subId": sub_id,
             "group": "Customers",
-            "comment": f"Bought via Bot | {datetime.now().strftime('%Y-%m-%d')}",
+            "comment": f"TG ID: {tg_id} | {total_gb}GB-{expiry_days}d | {datetime.now().strftime('%Y-%m-%d')}",
             "reset": 0,
             "resetDay": 0,
             "resetMax": 0,
