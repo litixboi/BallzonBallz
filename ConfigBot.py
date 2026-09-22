@@ -17,6 +17,7 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional, List, Dict, Any, Set
 from urllib.parse import parse_qs, quote, unquote
 
 import requests
@@ -79,13 +80,172 @@ logger.info("Workspace active directory: %s", script_dir)
 load_dotenv(dotenv_path=script_dir / ".env")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@litixconnect")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # optional: locks admin commands to one chat id
 UPDATE_INTERVAL_HOURS = max(1, int(os.getenv("UPDATE_INTERVAL_HOURS", "12")))
 NODE_TEST_WORKERS = max(1, int(os.getenv("NODE_TEST_WORKERS", "12")))
 bot_username = None
 
 PLANS_FILE = script_dir / "plans_config.json"
-user_pending_tx_order = {}  # user_id -> order_id for payment receipt uploads
+user_pending_tx_order = {}  # chat_id -> {"order_id": str, "timestamp": float}
+
+
+ADMIN_REGISTRY_FILE = script_dir / "admin_chat_registry.json"
+DEFAULT_ADMIN_USERNAMES = {"awlinavakhtam"}
+
+
+def _load_admin_registry() -> dict:
+    if ADMIN_REGISTRY_FILE.exists():
+        try:
+            return json.loads(ADMIN_REGISTRY_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"ids": [], "usernames_to_ids": {}}
+
+
+def _save_admin_registry(data: dict):
+    try:
+        ADMIN_REGISTRY_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning("Could not save admin registry: %s", e)
+
+
+def get_admin_targets() -> dict:
+    """Returns {'ids': set[str], 'usernames': set[str]} from env and defaults."""
+    raw = (os.getenv("ADMIN_CHAT_ID") or "").strip()
+    if not raw:
+        env_file = script_dir / ".env"
+        if env_file.exists():
+            load_dotenv(dotenv_path=env_file, override=True)
+            raw = (os.getenv("ADMIN_CHAT_ID") or "").strip()
+
+    usernames = set(DEFAULT_ADMIN_USERNAMES)
+    ids = set()
+
+    if raw:
+        for item in raw.replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "t.me/" in item:
+                item = item.split("t.me/")[-1].split("/")[0].strip()
+            item_clean = item.lstrip("@").lower()
+            if item.isdigit() or (item.startswith("-") and item[1:].isdigit()):
+                ids.add(str(item))
+            elif item_clean:
+                usernames.add(item_clean)
+
+    return {"ids": ids, "usernames": usernames}
+
+
+def register_admin_chat(user_id: Optional[int], username: Optional[str] = None):
+    """If user matches configured admin username or numeric ID, register their chat ID."""
+    if not user_id:
+        return
+    username_clean = (username or "").strip().lstrip("@").lower()
+    targets = get_admin_targets()
+
+    is_match = False
+    if str(user_id) in targets["ids"]:
+        is_match = True
+    if username_clean and username_clean in targets["usernames"]:
+        is_match = True
+
+    if is_match:
+        registry = _load_admin_registry()
+        changed = False
+        if int(user_id) not in registry.get("ids", []):
+            registry.setdefault("ids", []).append(int(user_id))
+            changed = True
+        if username_clean:
+            registry.setdefault("usernames_to_ids", {})
+            if registry["usernames_to_ids"].get(username_clean) != int(user_id):
+                registry["usernames_to_ids"][username_clean] = int(user_id)
+                changed = True
+        if changed:
+            _save_admin_registry(registry)
+            logger.info("Registered admin chat: user_id=%s, username=@%s", user_id, username_clean)
+
+
+def get_admin_chat_ids() -> list[int]:
+    """Retrieve verified integer admin chat IDs for sending alerts."""
+    targets = get_admin_targets()
+    registry = _load_admin_registry()
+    chat_ids = set()
+
+    for id_str in targets["ids"]:
+        try:
+            chat_ids.add(int(id_str))
+        except ValueError:
+            pass
+
+    for reg_id in registry.get("ids", []):
+        try:
+            chat_ids.add(int(reg_id))
+        except (ValueError, TypeError):
+            pass
+
+    return list(chat_ids)
+
+
+def is_admin(user_or_id, username: Optional[str] = None) -> bool:
+    """Strict check for admin authorization. Fails CLOSED.
+    Accepts telebot User object, int/str user ID, and optional username."""
+    if not user_or_id:
+        return False
+
+    user_id = None
+    u_name = None
+
+    if hasattr(user_or_id, "id"):
+        user_id = str(user_or_id.id)
+        u_name = getattr(user_or_id, "username", None)
+    elif isinstance(user_or_id, (int, str)):
+        val = str(user_or_id).strip()
+        if "t.me/" in val:
+            val = val.split("t.me/")[-1].split("/")[0].strip()
+        val_clean = val.lstrip("@").lower()
+        if val.isdigit() or (val.startswith("-") and val[1:].isdigit()):
+            user_id = val
+        else:
+            u_name = val_clean
+
+    if username and not u_name:
+        u_name = str(username).strip().lstrip("@").lower()
+    elif u_name:
+        u_name = str(u_name).strip().lstrip("@").lower()
+
+    targets = get_admin_targets()
+
+    # Check numeric ID match
+    if user_id and user_id in targets["ids"]:
+        if user_id.isdigit():
+            register_admin_chat(int(user_id), u_name)
+        return True
+
+    # Check username match (e.g. awlinavakhtam)
+    if u_name and u_name in targets["usernames"]:
+        if user_id and user_id.isdigit():
+            register_admin_chat(int(user_id), u_name)
+        return True
+
+    # Check registry mappings
+    registry = _load_admin_registry()
+    if user_id and int(user_id) in registry.get("ids", []):
+        return True
+
+    return False
+
+
+def get_pending_tx_order(chat_id: int) -> Optional[str]:
+    """Get pending order_id if not expired (30 minute TTL)."""
+    data = user_pending_tx_order.get(chat_id)
+    if not data:
+        return None
+    if isinstance(data, dict):
+        if time.time() - data.get("timestamp", 0) > 1800:
+            user_pending_tx_order.pop(chat_id, None)
+            return None
+        return data.get("order_id")
+    return str(data)
 
 
 def get_vip_plans():
@@ -1792,8 +1952,8 @@ def send_status(message):
 @bot.message_handler(commands=['post'])
 def manual_post(message):
     """Manual command to post all countries to channel"""
-    if ADMIN_CHAT_ID and str(message.chat.id) != ADMIN_CHAT_ID:
-        bot.reply_to(message, "⛔ This command is restricted.")
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
         return
     bot.reply_to(message, "📢 Posting all countries to channel...")
     threading.Thread(target=post_all_countries_to_channel, daemon=True).start()
@@ -1880,31 +2040,49 @@ def cmd_donate(message):
 
 @bot.message_handler(commands=['admin_id', 'my_id'])
 def cmd_admin_id(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    u_name = message.from_user.username
+    admin_active = is_admin(message.from_user) or is_admin(chat_id)
+    if admin_active:
+        register_admin_chat(user_id, u_name)
+        status_text = "✅ <b>حساب کاربری شما به عنوان مدیریت رسمی ربات فعال است.</b>"
+    else:
+        status_text = "⚠️ <b>شما دسترسی مدیریت ندارید. دسترسی مدیریت منحصراً به @awlinavakhtam اختصاص دارد.</b>"
+
     bot.reply_to(
         message,
-        f"🆔 <b>شناسه عددی شما (Chat ID):</b> <code>{message.chat.id}</code>\n\n"
-        f"برای فعال‌سازی دسترسی مدیریت، این شناسه را در فایل <code>.env</code> مقابل <code>ADMIN_CHAT_ID</code> قرار دهید.",
+        f"🆔 <b>شناسه عددی کاربری شما (User ID):</b> <code>{user_id}</code>\n"
+        f"💬 <b>شناسه چت (Chat ID):</b> <code>{chat_id}</code>\n"
+        f"👤 <b>نام کاربری:</b> @{html.escape(u_name or 'ندارد')}\n"
+        f"🛡 <b>وضعیت دسترسی:</b> {status_text}",
         parse_mode="HTML"
     )
 
 
 @bot.message_handler(commands=['orders'])
 def cmd_orders(message):
-    is_admin = bool(ADMIN_CHAT_ID and str(message.chat.id) == str(ADMIN_CHAT_ID))
-    if is_admin:
+    admin_active = is_admin(message.from_user) or is_admin(message.chat.id)
+    if admin_active:
         pending = order_mgr.get_pending_orders()
         if not pending:
             bot.reply_to(message, "✅ در حال حاضر هیچ سفارش معلقی برای بررسی وجود ندارد.")
             return
 
         for o in pending[:5]:
+            safe_oid = html.escape(str(o['order_id']))
+            safe_user = html.escape(str(o.get('username') or 'ندارد'))
+            safe_uid = html.escape(str(o['user_id']))
+            safe_plan = html.escape(str(o['plan_name']))
+            safe_net = html.escape(str(o.get('crypto_network') or 'نامشخص'))
+            safe_tx = html.escape(str(o.get('tx_hash') or 'ثبت شده با عکس'))
             text = (
                 f"🔔 <b>سفارش در انتظار تایید:</b>\n"
-                f"▫️ کد سفارش: <code>{o['order_id']}</code>\n"
-                f"▫️ کاربر: @{o['username']} (ID: <code>{o['user_id']}</code>)\n"
-                f"▫️ پلن: {o['plan_name']}\n"
-                f"▫️ مبلغ: {o['crypto_amount']} {o['crypto_currency']} ({o['crypto_network']})\n"
-                f"▫️ شناسه تراکنش (TxID): <code>{o.get('tx_hash', 'ثبت شده با عکس')}</code>"
+                f"▫️ کد سفارش: <code>{safe_oid}</code>\n"
+                f"▫️ کاربر: @{safe_user} (ID: <code>{safe_uid}</code>)\n"
+                f"▫️ پلن: {safe_plan}\n"
+                f"▫️ مبلغ: {o['crypto_amount']} {o['crypto_currency']} ({safe_net})\n"
+                f"▫️ شناسه تراکنش (TxID): <code>{safe_tx}</code>"
             )
             markup = types.InlineKeyboardMarkup(row_width=2)
             markup.add(
@@ -1913,7 +2091,7 @@ def cmd_orders(message):
             )
             if o.get("photo_file_id"):
                 try:
-                    bot.send_photo(message.chat.id, o["photo_file_id"], caption=text, reply_markup=markup, parse_mode="HTML")
+                    send_photo_safe(message.chat.id, o["photo_file_id"], caption=text, reply_markup=markup, parse_mode="HTML")
                     continue
                 except Exception:
                     pass
@@ -1925,7 +2103,7 @@ def cmd_orders(message):
 @bot.message_handler(commands=['post_vip', 'post_announcement'])
 def cmd_post_vip(message):
     """Admin command to post a Persian feature announcement to the channel."""
-    if ADMIN_CHAT_ID and str(message.chat.id) != str(ADMIN_CHAT_ID):
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
         bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
         return
 
@@ -1944,7 +2122,7 @@ def cmd_post_vip(message):
 @bot.message_handler(commands=['announce'])
 def cmd_announce(message):
     """Admin command to post custom Persian announcement with VIP CTA buttons."""
-    if ADMIN_CHAT_ID and str(message.chat.id) != str(ADMIN_CHAT_ID):
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
         bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
         return
 
@@ -2172,25 +2350,51 @@ def handle_payment_network(call):
 def handle_submit_tx(call):
     order_id = call.data.split(":", 1)[1]
     chat_id = call.message.chat.id
+    user_id = call.from_user.id
     try:
         bot.answer_callback_query(call.id)
     except Exception:
         pass
 
-    user_pending_tx_order[chat_id] = order_id
+    order = order_mgr.get_order(order_id)
+    if not order:
+        send_message_safe(chat_id, "⚠️ سفارش مورد نظر یافت نشد.")
+        return
+
+    # IDOR check: Verify order ownership
+    if order.get("user_id") != user_id:
+        send_message_safe(chat_id, "⛔ شما مجاز به ویرایش این سفارش نیستید.")
+        return
+
+    # Disallow submitting for already approved orders
+    if order.get("status") == "APPROVED":
+        send_message_safe(chat_id, "✅ این سفارش قبلاً تایید و فعال شده است.")
+        return
+
+    user_pending_tx_order[chat_id] = {"order_id": order_id, "timestamp": time.time()}
     text = (
-        f"📥 <b>ارسال مدرک پرداخت برای سفارش <code>{order_id}</code>:</b>\n\n"
+        f"📥 <b>ارسال مدرک پرداخت برای سفارش <code>{html.escape(order_id)}</code>:</b>\n\n"
         f"لطفاً در پاسخ به این پیام، <b>کد پیگیری تراکنش (TxID / Hash)</b> یا <b>عکس اسکرین‌شات رسید واریز</b> را ارسال فرمایید.\n\n"
-        f"<i>(سیستم به صورت خودکار رسید شما را دریافت و به مدیریت ارسال می‌کند)</i>"
+        f"<i>(برای لغو فرآیند ارسال رسید می‌توانید دستور /cancel را ارسال کنید)</i>"
     )
     send_message_safe(chat_id, text, parse_mode="HTML")
+
+
+@bot.message_handler(commands=['cancel'])
+def cmd_cancel_receipt_upload(message):
+    chat_id = message.chat.id
+    if chat_id in user_pending_tx_order:
+        user_pending_tx_order.pop(chat_id, None)
+        send_message_safe(chat_id, "❌ فرآیند ارسال رسید پرداخت لغو شد.")
+    else:
+        send_message_safe(chat_id, "عملیات فعالی جهت لغو وجود ندارد.")
 
 
 # --- ADMIN ORDER APPROVAL / REJECTION CALLBACKS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_approve:") or call.data.startswith("admin_reject:"))
 def handle_admin_decision(call):
-    is_admin = bool(not ADMIN_CHAT_ID or str(call.message.chat.id) == str(ADMIN_CHAT_ID) or str(call.from_user.id) == str(ADMIN_CHAT_ID))
-    if not is_admin:
+    # STRICT ADMIN AUTHORIZATION CHECK - Fail CLOSED
+    if not is_admin(call.from_user):
         try:
             bot.answer_callback_query(call.id, "⛔ شما دسترسی مدیریت ندارید.", show_alert=True)
         except Exception:
@@ -2209,9 +2413,24 @@ def handle_admin_decision(call):
     if order["status"] == "APPROVED":
         try:
             bot.answer_callback_query(call.id, "این سفارش قبلاً تایید شده است.", show_alert=True)
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         except Exception:
             pass
         return
+
+    if order["status"] == "REJECTED":
+        try:
+            bot.answer_callback_query(call.id, "این سفارش قبلاً رد شده است.", show_alert=True)
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    # Immediately remove buttons to prevent double-click race conditions
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
 
     if action == "admin_reject":
         order_mgr.reject_order(order_id, reason="رد توسط ادمین")
@@ -2219,14 +2438,18 @@ def handle_admin_decision(call):
             bot.answer_callback_query(call.id, f"سفارش {order_id} رد شد.")
         except Exception:
             pass
-        try:
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        except Exception:
-            pass
-        send_message_safe(order["user_id"], f"❌ سفارش <code>{order_id}</code> توسط مدیریت تایید نشد. در صورت بروز هرگونه مشکل با پشتیبانی در ارتباط باشید.", parse_mode="HTML")
+        send_message_safe(order["user_id"], f"❌ سفارش <code>{html.escape(order_id)}</code> توسط مدیریت تایید نشد. در صورت بروز هرگونه مشکل با پشتیبانی در ارتباط باشید.", parse_mode="HTML")
+        send_message_safe(call.message.chat.id, f"❌ سفارش <code>{html.escape(order_id)}</code> رد شد.", parse_mode="HTML")
         return
 
-    # admin_approve: create client on conpanel (3x-ui)
+    # admin_approve: acquire atomic approval lock
+    if not order_mgr.start_approving_order(order_id):
+        try:
+            bot.answer_callback_query(call.id, "این سفارش در حال پردازش یا قبلاً تکمیل شده است.", show_alert=True)
+        except Exception:
+            pass
+        return
+
     try:
         bot.answer_callback_query(call.id, f"در حال ایجاد کانفیگ برای {order_id}...")
     except Exception:
@@ -2242,9 +2465,16 @@ def handle_admin_decision(call):
     )
 
     if not creation_res.get("success"):
+        order_mgr.cancel_approving_order(order_id)
         err_msg = creation_res.get("error", "Unknown panel error")
         logger.error("Failed to auto-create client for %s: %s", order_id, err_msg)
-        send_message_safe(call.message.chat.id, f"❌ خطا در ساخت کانفیگ روی سرور برای سفارش {order_id}: {err_msg}")
+        # Re-attach markup so admin can retry after fixing panel
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("🔄 تلاش مجدد برای تایید", callback_data=f"admin_approve:{order_id}"),
+            types.InlineKeyboardButton("❌ رد سفارش", callback_data=f"admin_reject:{order_id}"),
+        )
+        send_message_safe(call.message.chat.id, f"❌ خطا در ساخت کانفیگ روی سرور برای سفارش <code>{html.escape(order_id)}</code>:\n{html.escape(str(err_msg))}", reply_markup=markup, parse_mode="HTML")
         return
 
     sub_url = creation_res["sub_url"]
@@ -2256,15 +2486,15 @@ def handle_admin_decision(call):
         qr_bytes = crypto_manager.generate_qr_bytes(sub_url)
         cust_msg = (
             f"🎉 <b>سفارش شما با موفقیت تایید و فعال شد!</b>\n\n"
-            f"🆔 <b>کد پیگیری:</b> <code>{order_id}</code>\n"
-            f"📦 <b>پلن:</b> {order['plan_name']}\n"
+            f"🆔 <b>کد پیگیری:</b> <code>{html.escape(order_id)}</code>\n"
+            f"📦 <b>پلن:</b> {html.escape(str(order['plan_name']))}\n"
             f"📊 <b>حجم ترافیک:</b> {order['volume_gb']} گیگابایت\n"
             f"⏳ <b>مدت اعتبار:</b> {order['duration_days']} روز\n"
             f"👥 <b>تعداد کاربر مجاز:</b> {order.get('devices', 1)} دستگاه\n\n"
             f"🔗 <b>لینک سابسکریپشن اختصاصی شما (برای کپی لمس کنید):</b>\n"
-            f"<code>{sub_url}</code>\n\n"
+            f"<code>{html.escape(sub_url)}</code>\n\n"
             f"📱 <b>لینک سابسکریپشن مخصوص Sing-box / Clash:</b>\n"
-            f"<code>{json_url}</code>\n\n"
+            f"<code>{html.escape(json_url)}</code>\n\n"
             f"💡 <b>راهنمای اتصال:</b>\n"
             f"۱. لینک فوق را کپی کنید یا بارکد QR زیر را در برنامه اسکن فرمایید.\n"
             f"۲. در برنامه <b>v2rayNG</b> یا <b>V2Box</b> یا <b>Streisand</b> به بخش Subscription رفته و Update را بزنید.\n"
@@ -2274,26 +2504,45 @@ def handle_admin_decision(call):
         send_photo_safe(order["user_id"], qr_bytes, caption=cust_msg, parse_mode="HTML")
     except Exception as e:
         logger.error("Failed to deliver subscription to user %s: %s", order["user_id"], e)
-        send_message_safe(order["user_id"], f"✅ کانفیگ شما ساخته شد:\n<code>{sub_url}</code>", parse_mode="HTML")
+        send_message_safe(order["user_id"], f"✅ کانفیگ شما ساخته شد:\n<code>{html.escape(sub_url)}</code>", parse_mode="HTML")
 
-    try:
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-    except Exception:
-        pass
-    send_message_safe(call.message.chat.id, f"✅ سفارش <code>{order_id}</code> با موفقیت تایید شد و لینک برای کاربر ارسال گردید.", parse_mode="HTML")
+    send_message_safe(call.message.chat.id, f"✅ سفارش <code>{html.escape(order_id)}</code> با موفقیت تایید شد و لینک برای کاربر ارسال گردید.", parse_mode="HTML")
 
 
 # --- USER PAYMENT RECEIPT LISTENER (Photo or Text TxID) ---
-@bot.message_handler(content_types=['text', 'photo'], func=lambda m: m.chat.id in user_pending_tx_order)
+@bot.message_handler(content_types=['text', 'photo'], func=lambda m: bool(get_pending_tx_order(m.chat.id)))
 def handle_payment_receipt_upload(message):
     chat_id = message.chat.id
-    order_id = user_pending_tx_order.pop(chat_id, None)
+    order_id = get_pending_tx_order(chat_id)
     if not order_id:
         return
+
+    # Check if message is a command
+    if message.content_type == 'text' and message.text and message.text.startswith('/'):
+        cmd_text = message.text.strip().lower()
+        if cmd_text in ('/cancel', '/start', '/help', '/buy', '/orders', '/status'):
+            user_pending_tx_order.pop(chat_id, None)
+            if cmd_text == '/cancel':
+                bot.reply_to(message, "❌ فرآیند ارسال رسید پرداخت لغو شد.")
+                return
+            # Let other registered handlers process standard commands
+            return
+
+    # Clear pending status now that receipt is received
+    user_pending_tx_order.pop(chat_id, None)
 
     order = order_mgr.get_order(order_id)
     if not order:
         bot.reply_to(message, "⚠️ سفارش معتبری یافت نشد.")
+        return
+
+    # Check ownership
+    if order.get("user_id") != message.from_user.id:
+        bot.reply_to(message, "⚠️ این سفارش متعلق به حساب کاربری شما نیست.")
+        return
+
+    if order.get("status") == "APPROVED":
+        bot.reply_to(message, "✅ این سفارش قبلاً تایید و فعال شده است.")
         return
 
     tx_hash = None
@@ -2301,32 +2550,55 @@ def handle_payment_receipt_upload(message):
 
     if message.content_type == 'photo':
         photo_file_id = message.photo[-1].file_id
-        tx_hash = message.caption or "ارسالی از طریق عکس رسید"
+        tx_hash = (message.caption or "ارسالی از طریق عکس رسید").strip()
     else:
         tx_hash = message.text.strip()
 
-    order_mgr.submit_payment_proof(order_id, tx_hash=tx_hash, photo_file_id=photo_file_id)
+    order_mgr.submit_payment_proof(order_id, tx_hash=tx_hash, photo_file_id=photo_file_id, user_id=message.from_user.id)
 
-    # Confirm to user
+    # 1. Confirm ONLY to the user (NEVER send admin approval buttons here!)
     bot.reply_to(
         message,
-        f"✅ <b>رسید پرداخت شما برای سفارش <code>{order_id}</code> دریافت شد!</b>\n\n"
-        f"اطلاعات پرداخت جهت تایید به مدیریت ارسال گردید. "
+        f"✅ <b>رسید پرداخت شما برای سفارش <code>{html.escape(order_id)}</code> دریافت شد!</b>\n\n"
+        f"اطلاعات پرداخت جهت بررسی و تایید به مدیریت ارسال گردید. "
         f"به محض تایید، کانفیگ اختصاصی شما به صورت خودکار در همین چت تحویل داده خواهد شد. "
         f"از صبوری شما سپاسگزاریم! 🙏",
         parse_mode="HTML"
     )
 
-    # Dispatch alert to Admin
-    target_admin_chat = ADMIN_CHAT_ID if ADMIN_CHAT_ID else chat_id
+    # 2. Dispatch alert STRICTLY and ONLY to verified Admin(s)
+    admin_chats = get_admin_chat_ids()
+    if not admin_chats:
+        logger.critical(
+            "⚠️ CRITICAL ALERT: Payment proof submitted for order %s, "
+            "but no active chat found for admin (@awlinavakhtam). "
+            "Order is safely saved as PENDING_VERIFICATION in orders.json.",
+            order_id
+        )
+        send_message_safe(
+            chat_id,
+            "⚠️ <i>رسید پرداخت شما برای سفارش با موفقیت ثبت شد و در صف بررسی مدیریت (@awlinavakhtam) قرار گرفت. "
+            "به محض تایید، کانفیگ اختصاصی شما به صورت خودکار در همین چت تحویل داده خواهد شد.</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    safe_oid = html.escape(str(order_id))
+    safe_user = html.escape(str(order.get('username') or 'ندارد'))
+    safe_uid = html.escape(str(order['user_id']))
+    safe_first = html.escape(str(order.get('first_name') or 'کاربر'))
+    safe_plan = html.escape(str(order['plan_name']))
+    safe_net = html.escape(str(order.get('crypto_network') or 'نامشخص'))
+    safe_tx = html.escape(str(tx_hash)[:500])
+
     admin_alert = (
         f"🔔 <b>رسید پرداخت جدید دریافت شد!</b>\n\n"
-        f"🆔 <b>شناسه سفارش:</b> <code>{order_id}</code>\n"
-        f"👤 <b>کاربر:</b> @{order['username']} (ID: <code>{order['user_id']}</code> | نام: {order['first_name']})\n"
-        f"📦 <b>پلن انتخابی:</b> {order['plan_name']} ({order['volume_gb']}GB / {order['duration_days']} روز)\n"
-        f"🌐 <b>شبکه:</b> {order['crypto_network']}\n"
+        f"🆔 <b>شناسه سفارش:</b> <code>{safe_oid}</code>\n"
+        f"👤 <b>کاربر:</b> @{safe_user} (ID: <code>{safe_uid}</code> | نام: {safe_first})\n"
+        f"📦 <b>پلن انتخابی:</b> {safe_plan} ({order['volume_gb']}GB / {order['duration_days']} روز)\n"
+        f"🌐 <b>شبکه:</b> {safe_net}\n"
         f"💰 <b>مبلغ مورد انتظار:</b> {order['crypto_amount']} {order['crypto_currency']}\n"
-        f"🔗 <b>شناسه تراکنش (TxID):</b>\n<code>{tx_hash}</code>"
+        f"🔗 <b>شناسه تراکنش (TxID):</b>\n<code>{safe_tx}</code>"
     )
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -2334,14 +2606,21 @@ def handle_payment_receipt_upload(message):
         types.InlineKeyboardButton("❌ رد سفارش", callback_data=f"admin_reject:{order_id}"),
     )
 
-    if photo_file_id:
-        try:
-            bot.send_photo(target_admin_chat, photo_file_id, caption=admin_alert, reply_markup=markup, parse_mode="HTML")
-            return
-        except Exception as e:
-            logger.warning("Could not send receipt photo to admin: %s", e)
+    for admin_chat in admin_chats:
+        if photo_file_id:
+            try:
+                # If caption fits Telegram's 1024-char limit, send together
+                if len(admin_alert) <= 950:
+                    send_photo_safe(admin_chat, photo_file_id, caption=admin_alert, reply_markup=markup, parse_mode="HTML")
+                else:
+                    short_caption = f"🧾 عکس رسید پرداخت سفارش <code>{safe_oid}</code> از @{safe_user}"
+                    send_photo_safe(admin_chat, photo_file_id, caption=short_caption, parse_mode="HTML")
+                    send_message_safe(admin_chat, admin_alert, reply_markup=markup, parse_mode="HTML")
+                continue
+            except Exception as e:
+                logger.warning("Could not send receipt photo to admin %s: %s", admin_chat, e)
 
-    send_message_safe(target_admin_chat, admin_alert, reply_markup=markup, parse_mode="HTML")
+        send_message_safe(admin_chat, admin_alert, reply_markup=markup, parse_mode="HTML")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("country:"))

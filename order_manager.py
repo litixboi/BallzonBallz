@@ -93,12 +93,21 @@ class OrderManager:
         order_id: str,
         tx_hash: Optional[str] = None,
         photo_file_id: Optional[str] = None,
+        user_id: Optional[int] = None,
     ) -> bool:
         """Record user's transaction hash or receipt photo and advance to PENDING_VERIFICATION."""
         with _lock:
             if order_id not in self._orders:
                 return False
             order = self._orders[order_id]
+            # Disallow proof submission if order is already completed
+            if order.get("status") == "APPROVED":
+                logger.warning("Attempted to submit proof for already approved order %s", order_id)
+                return False
+            if user_id is not None and order.get("user_id") != user_id:
+                logger.warning("User %s attempted to submit proof for order %s belonging to %s", user_id, order_id, order.get("user_id"))
+                return False
+
             if tx_hash:
                 order["tx_hash"] = tx_hash.strip()
             if photo_file_id:
@@ -128,11 +137,33 @@ class OrderManager:
         with _lock:
             return [o for o in self._orders.values() if o["status"] == "PENDING_VERIFICATION"]
 
+    def start_approving_order(self, order_id: str) -> bool:
+        """Atomically lock an order for approval to prevent concurrent double-issuance."""
+        with _lock:
+            if order_id not in self._orders:
+                return False
+            order = self._orders[order_id]
+            if order.get("status") in ("APPROVED", "REJECTED") or order.get("_approving"):
+                return False
+            order["_approving"] = True
+            self._save()
+            return True
+
+    def cancel_approving_order(self, order_id: str) -> bool:
+        """Release the approval lock if server config generation failed."""
+        with _lock:
+            if order_id in self._orders:
+                self._orders[order_id].pop("_approving", None)
+                self._save()
+                return True
+            return False
+
     def approve_order(self, order_id: str, sub_url: str) -> bool:
         with _lock:
             if order_id not in self._orders:
                 return False
             order = self._orders[order_id]
+            order.pop("_approving", None)
             order["status"] = "APPROVED"
             order["delivered_sub_url"] = sub_url
             order["resolved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -144,6 +175,7 @@ class OrderManager:
             if order_id not in self._orders:
                 return False
             order = self._orders[order_id]
+            order.pop("_approving", None)
             order["status"] = "REJECTED"
             order["reject_reason"] = reason
             order["resolved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
