@@ -11,7 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     unzip \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf
 
 WORKDIR /app
 

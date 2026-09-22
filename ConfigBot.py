@@ -33,6 +33,21 @@ from conpanel_api import conpanel_mgr
 from order_manager import order_mgr
 import persian_announcements
 
+# --- FORCE IPv4 GLOBALLY TO PREVENT [Errno 101] Network is unreachable ON CLOUD HOSTS ---
+import urllib3.util.connection as urllib3_conn
+
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if family == 0 or family == socket.AF_UNSPEC:
+        family = socket.AF_INET
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_getaddrinfo
+urllib3_conn.allowed_gai_family = lambda: socket.AF_INET
+
 # --- LOGGING SETUP (timestamps + levels, ready for Railway logs) ---
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +57,20 @@ logging.basicConfig(
 logger = logging.getLogger("ConfigBot")
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("TeleBot").setLevel(logging.WARNING)
+
+# Configure telebot apihelper with connection pooling & retries
+import telebot.apihelper as apihelper
+apihelper.RETRY_ON_ERROR = True
+apihelper.CONNECT_TIMEOUT = 15
+apihelper.READ_TIMEOUT = 30
+
+telebot_session = requests.Session()
+_telebot_adapter = HTTPAdapter(
+    max_retries=Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+)
+telebot_session.mount("https://", _telebot_adapter)
+telebot_session.mount("http://", _telebot_adapter)
+apihelper.session = telebot_session
 
 # --- CONTEXT-AWARE CONFIGURATION & ENV LOADING ---
 script_dir = Path(__file__).parent
@@ -1020,6 +1049,7 @@ def safe_api_call(func, *args, **kwargs):
     """Call a Telegram API method; on 429 sleep exactly as long as Telegram asks,
     on parse errors retry without parse_mode. Never gives up on flood waits."""
     flood_waits = 0
+    net_retries = 0
     while True:
         try:
             return func(*args, **kwargs)
@@ -1033,6 +1063,14 @@ def safe_api_call(func, *args, **kwargs):
             if "parse" in str(e).lower() or "can't parse" in str(e).lower():
                 logger.warning("Parse error, retrying without parse_mode: %s", e)
                 kwargs.pop("parse_mode", None)
+                continue
+            raise
+        except (requests.exceptions.RequestException, Exception) as e:
+            err_str = str(e).lower()
+            if net_retries < 5 and ("network" in err_str or "connection" in err_str or "timeout" in err_str or "errno" in err_str):
+                net_retries += 1
+                logger.warning("Network glitch in safe_api_call (%s), retry %d/5 in 2s...", e, net_retries)
+                time.sleep(2)
                 continue
             raise
 
@@ -1711,8 +1749,8 @@ def send_welcome(message):
             show_donation_menu(message.chat.id)
             return
 
-    bot.reply_to(
-        message,
+    send_message_safe(
+        message.chat.id,
         get_welcome_text(),
         reply_markup=build_main_menu_keyboard(),
         parse_mode="HTML"
@@ -2401,12 +2439,15 @@ if __name__ == "__main__":
     cleanup_xray_temp_files()
     load_state()
 
-    try:
-        me = bot.get_me()
-        bot_username = me.username
-        logger.info("Connected to Telegram Bot: @%s (ID: %s)", bot_username, me.id)
-    except Exception as e:
-        logger.warning("Could not fetch bot identity: %s", e)
+    for attempt in range(5):
+        try:
+            me = bot.get_me()
+            bot_username = me.username
+            logger.info("Connected to Telegram Bot: @%s (ID: %s)", bot_username, me.id)
+            break
+        except Exception as e:
+            logger.warning("Could not fetch bot identity (attempt %d/5): %s", attempt + 1, e)
+            time.sleep(2)
 
     # Register Bot Menu Commands with Telegram
     try:
