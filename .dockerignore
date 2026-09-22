@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+!.env.example
+orders.json
+test_integration.py
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.claude
+xray_bin/tmp*
