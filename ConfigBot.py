@@ -1,9 +1,12 @@
 import base64
+import contextlib
+import functools
 import html
 import itertools
 import json
 import logging
 import os
+import queue
 import random
 import re
 import socket
@@ -25,6 +28,11 @@ from telebot import types
 from telebot.apihelper import ApiTelegramException
 import geoip2.database
 
+import crypto_manager
+from conpanel_api import conpanel_mgr
+from order_manager import order_mgr
+import persian_announcements
+
 # --- LOGGING SETUP (timestamps + levels, ready for Railway logs) ---
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +50,23 @@ logger.info("Workspace active directory: %s", script_dir)
 load_dotenv(dotenv_path=script_dir / ".env")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@litixconnect")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # optional: locks /post to one chat id
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # optional: locks admin commands to one chat id
+UPDATE_INTERVAL_HOURS = max(1, int(os.getenv("UPDATE_INTERVAL_HOURS", "12")))
+NODE_TEST_WORKERS = max(1, int(os.getenv("NODE_TEST_WORKERS", "12")))
+bot_username = None
+
+PLANS_FILE = script_dir / "plans_config.json"
+user_pending_tx_order = {}  # user_id -> order_id for payment receipt uploads
+
+
+def get_vip_plans():
+    try:
+        if PLANS_FILE.exists():
+            return json.loads(PLANS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to load plans_config.json: %s", e)
+    return []
+
 
 if not BOT_TOKEN:
     raise ValueError("❌ Error: BOT_TOKEN is missing! Check your .env file.")
@@ -171,16 +195,16 @@ BUTTON_TO_COUNTRY = {v: v for v in COUNTRY_DATA.keys() if v != "Others"}
 BUTTON_TO_COUNTRY["Others"] = "Others"
 
 categorized_nodes = {k: [] for k in BUTTON_TO_COUNTRY.keys()}
+nodes_lock = threading.Lock()
 user_session_offsets = {}
 offsets_lock = threading.Lock()
 last_update_time = None  # human-readable UTC string of the last successful scan
 
 MAX_TRACKED_USERS = 2000   # cap on user_session_offsets to bound memory
-UPDATE_INTERVAL = 2 * 60 * 60  # 2 hours, aligned to even UTC hour boundaries
+UPDATE_INTERVAL = UPDATE_INTERVAL_HOURS * 3600  # aligned to UTC hour boundaries (default: 12h)
 STATE_PATH = script_dir / "bot_state.json"
 TOP_PICKS_COUNTRIES = 5      # quick-picks file covers the countries with the most live configs
 TOP_PICKS_PER_COUNTRY = 50   # random picks per top country, never two on the same address
-NODE_TEST_WORKERS = 12       # concurrent Xray instances (each ~20MB RAM; ~300MB peak)
 
 
 # --- STATE PERSISTENCE (survives process restarts) ---
@@ -189,7 +213,9 @@ def save_state():
     try:
         with offsets_lock:
             offsets_snapshot = {str(k): v for k, v in user_session_offsets.items()}
-        state = {"nodes": categorized_nodes, "offsets": offsets_snapshot, "last_update": last_update_time}
+        with nodes_lock:
+            nodes_snapshot = {k: list(v) for k, v in categorized_nodes.items()}
+        state = {"nodes": nodes_snapshot, "offsets": offsets_snapshot, "last_update": last_update_time}
         tmp = STATE_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(state), encoding="utf-8")
         tmp.replace(STATE_PATH)
@@ -205,9 +231,11 @@ def load_state():
             return
         state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         nodes = state.get("nodes") or {}
-        for key in categorized_nodes:
-            if isinstance(nodes.get(key), list):
-                categorized_nodes[key] = [l for l in nodes[key] if isinstance(l, str)]
+        with nodes_lock:
+            for key in categorized_nodes:
+                if isinstance(nodes.get(key), list):
+                    categorized_nodes[key] = [l for l in nodes[key] if isinstance(l, str)]
+            total = sum(len(v) for v in categorized_nodes.values())
         offsets = state.get("offsets") or {}
         with offsets_lock:
             for chat_id, per_country in offsets.items():
@@ -219,7 +247,6 @@ def load_state():
                     except ValueError:
                         continue
         last_update_time = state.get("last_update")
-        total = sum(len(v) for v in categorized_nodes.values())
         logger.info("Restored state: %d configs, %d users, last update %s",
                     total, len(user_session_offsets), last_update_time)
     except Exception as e:
@@ -252,17 +279,39 @@ XRAY_DL_PREFIXES = [  # tried in order; mirrors dodge GitHub rate-limits on shar
 ]
 XRAY_SETUP_FAILED_UNTIL = 0.0  # monotonic time before which binary setup is skipped (negative cache)
 CONNECTIVITY_URLS = ["http://cp.cloudflare.com/generate_204", "http://www.gstatic.com/generate_204"]
-SOCKS_PORT_RANGE = itertools.count(10001)
-_socks_ports_lock = threading.Lock()
+
+# Thread-safe reusable port pool for verifier SOCKS inbounds (prevents >65535 integer overflow)
+_port_pool = queue.Queue()
+for _p in range(10001, 10001 + NODE_TEST_WORKERS * 3):
+    _port_pool.put(_p)
+
+
+@contextlib.contextmanager
+def acquire_socks_port():
+    """Borrow an available port from the pool and return it when done."""
+    port = _port_pool.get()
+    try:
+        yield port
+    finally:
+        _port_pool.put(port)
+
+
+def cleanup_xray_temp_files():
+    """Remove any orphan temporary config files left in xray_bin from previous runs."""
+    try:
+        if XRAY_DIR.exists():
+            for tmp_file in XRAY_DIR.glob("tmp*.json"):
+                try:
+                    tmp_file.unlink()
+                except OSError:
+                    pass
+    except Exception as e:
+        logger.debug("Failed to clean up xray temp files: %s", e)
+
+
 _xray_setup_lock = threading.Lock()
 _xray_ready = False
 XRAY_EXE = None  # set by ensure_xray_binary(); None = degraded TCP-only mode
-
-
-def next_socks_port():
-    """Hand out a unique local port for one verifier's SOCKS inbound."""
-    with _socks_ports_lock:
-        return next(SOCKS_PORT_RANGE)
 
 
 def ensure_xray_binary():
@@ -616,88 +665,110 @@ def verify_node(line):
     except OSError:
         return False, None
 
-    port = next_socks_port()
-    test_cfg = {
-        "log": {"loglevel": "error"},
-        "inbounds": [{
-            "tag": "in0",
-            "listen": "127.0.0.1",
-            "port": port,
-            "protocol": "socks",
-            "settings": {"auth": "noauth", "udp": False},
-        }],
-        "outbounds": [outbound, {"tag": "direct", "protocol": "freedom"}],
-        "routing": {"rules": [{"type": "field", "inboundTag": ["in0"], "outboundTag": "test"}]},
-    }
-    cfg_path = None
-    proc = None
-    try:
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
-                                          encoding="utf-8", dir=str(XRAY_DIR)) as f:
-            json.dump(test_cfg, f)
-            cfg_path = Path(f.name)
-        proc = subprocess.Popen([str(exe), "run", "-c", str(cfg_path)],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # wait for the SOCKS port to come up (xray binds almost instantly)
-        deadline = time.monotonic() + 1.5
-        while time.monotonic() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.3):
-                    break
-            except OSError:
-                time.sleep(0.1)
-        else:
+    with acquire_socks_port() as port:
+        test_cfg = {
+            "log": {"loglevel": "error"},
+            "inbounds": [{
+                "tag": "in0",
+                "listen": "127.0.0.1",
+                "port": port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": False},
+            }],
+            "outbounds": [outbound, {"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [{"type": "field", "inboundTag": ["in0"], "outboundTag": "test"}]},
+        }
+        cfg_path = None
+        proc = None
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                              encoding="utf-8", dir=str(XRAY_DIR)) as f:
+                json.dump(test_cfg, f)
+                cfg_path = Path(f.name)
+            proc = subprocess.Popen([str(exe), "run", "-c", str(cfg_path)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    creationflags=creationflags)
+            # wait for the SOCKS port to come up (xray binds almost instantly)
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                        break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                return False, None
+            start = time.monotonic()
+            for url in CONNECTIVITY_URLS:
+                try:
+                    res = requests.get(url, proxies={
+                        "http": f"socks5h://127.0.0.1:{port}",
+                        "https": f"socks5h://127.0.0.1:{port}",
+                    }, timeout=(5, 5))
+                    # 2xx/3xx through the tunnel = the node really proxies traffic.
+                    # Any other status means the tunnel itself is alive but the
+                    # exit rejected the request - keep trying the other URLs.
+                    if res.status_code < 300:
+                        return True, int((time.monotonic() - start) * 1000)
+                except Exception:
+                    continue
             return False, None
-        start = time.monotonic()
-        for url in CONNECTIVITY_URLS:
-            try:
-                res = requests.get(url, proxies={
-                    "http": f"socks5h://127.0.0.1:{port}",
-                    "https": f"socks5h://127.0.0.1:{port}",
-                }, timeout=(5, 5))
-                # 2xx/3xx through the tunnel = the node really proxies traffic.
-                # Any other status means the tunnel itself is alive but the
-                # exit rejected the request - keep trying the other URLs.
-                if res.status_code < 300:
-                    return True, int((time.monotonic() - start) * 1000)
-            except Exception:
-                continue
-        return False, None
-    except Exception:
-        return False, None
-    finally:
-        if proc is not None:
-            proc.kill()
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
-        if cfg_path is not None:
-            try:
-                cfg_path.unlink()
-            except OSError:
-                pass
+        except Exception:
+            return False, None
+        finally:
+            if proc is not None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            if cfg_path is not None:
+                try:
+                    cfg_path.unlink()
+                except OSError:
+                    pass
 
 
 # --- UTILITY PARSING AND TESTING PIPELINES ---
 def extract_host_and_port(config_line):
+    """Extract (host, port) from any vmess/vless/ss/trojan URI with full IPv6 support."""
     try:
-        if config_line.startswith("vmess://"):
-            b64_data = config_line.replace("vmess://", "").strip()
-            b64_data += "=" * ((4 - len(b64_data) % 4) % 4)
-            decoded = base64.b64decode(b64_data).decode('utf-8')
-            data = json.loads(decoded)
-            return data.get("add"), int(data.get("port"))
-
-        elif any(config_line.startswith(p) for p in ["vless://", "ss://", "trojan://", "ssr://"]):
-            match = re.search(r'@([^:]+):([0-9]+)', config_line)
-            if match:
-                return match.group(1), int(match.group(2))
+        config_line = config_line.strip()
+        scheme = config_line.split("://", 1)[0].lower() if "://" in config_line else ""
+        if scheme == "vmess":
+            b64_data = _b64pad(config_line[8:].strip())
+            data = json.loads(base64.b64decode(b64_data).decode('utf-8'))
+            add = data.get("add")
+            port = data.get("port")
+            if add and port:
+                return str(add).strip(), int(port)
+        elif scheme in ("vless", "trojan"):
+            rest = unquote(config_line.split("://", 1)[1])
+            if "#" in rest:
+                rest = rest.split("#", 1)[0]
+            hostpart = rest.split("@", 1)[1] if "@" in rest else rest
+            hostpart = hostpart.split("?", 1)[0]
+            return parse_host_port(hostpart)
+        elif scheme == "ss":
+            rest = config_line.split("://", 1)[1]
+            if "#" in rest:
+                rest = rest.split("#", 1)[0]
+            if "@" in rest:
+                _, hostport = rest.rsplit("@", 1)
+                hostport = hostport.split("?", 1)[0]
+                return parse_host_port(hostport)
+            else:
+                decoded = base64.b64decode(_b64pad(rest.split("?", 1)[0])).decode("utf-8")
+                if "@" in decoded:
+                    _, hostport = decoded.rsplit("@", 1)
+                    return parse_host_port(hostport)
     except Exception:
         pass
     return None, None
 
 
+@functools.lru_cache(maxsize=8192)
 def get_country_local(host):
     try:
         ip = socket.gethostbyname(host)
@@ -715,13 +786,13 @@ def node_key(config_line):
     host, port = extract_host_and_port(config_line)
     if not host or not port:
         return None
-    scheme = config_line.split("://", 1)[0].lower()
+    scheme = config_line.split("://", 1)[0].lower() if "://" in config_line else "unknown"
     return f"{scheme}://{host.lower()}:{port}"
 
 
-def test_single_node(line):
+def test_single_node(line, known_country=None):
     """Real end-to-end verification: Xray-core SOCKS handshake + HTTP fetch.
-    Falls back to the old TCP-connect check only when the binary is unavailable."""
+    If known_country is given (e.g. Au1rxx), skips DNS resolution and GeoIP lookup."""
     host, port = extract_host_and_port(line)
     if not host or not port:
         return None
@@ -730,13 +801,11 @@ def test_single_node(line):
     if not ok:
         return None
 
-    country_name = get_country_local(host)
-
-    assigned_bucket = "Others"
-    for bot_button, full_country_name in BUTTON_TO_COUNTRY.items():
-        if country_name == full_country_name:
-            assigned_bucket = bot_button
-            break
+    if known_country and known_country in BUTTON_TO_COUNTRY:
+        assigned_bucket = known_country
+    else:
+        country_name = get_country_local(host)
+        assigned_bucket = country_name if country_name in BUTTON_TO_COUNTRY else "Others"
 
     return {"bucket": assigned_bucket, "raw_line": line, "latency": latency}
 
@@ -778,35 +847,68 @@ def decode_base64_content(content):
     except Exception:
         return content.splitlines()
 
-def fetch_au1rxx_configs():
-    """Fetch v2ray configs from Au1rxx GitHub repo for all supported countries.
-
-    Bigger countries publish multiple parts (v2ray-base64-0001.txt, -0002.txt, ...);
-    we walk them until the first 404 so no configs are left behind.
-    """
-    configs_by_country = {country: [] for country in COUNTRY_DATA.keys()}
-
-    for country_code, country_name in AU1RXX_COUNTRIES.items():
-        fetched = 0
-        for part in range(1, AU1RXX_PARTS + 1):
-            url = f"{AU1RXX_BASE}/{country_code}/v2ray-base64-{part:04d}.txt"
+def fetch_sources_configs():
+    """Fetch all original SOURCES concurrently with automatic mirror fallback."""
+    raw_lines = []
+    with ThreadPoolExecutor(max_workers=len(SOURCES)) as executor:
+        futures = {executor.submit(http_get, url, 12): url for url in SOURCES}
+        for future in as_completed(futures):
+            url = futures[future]
             try:
-                res = http_get(url, timeout=15)
-                if res.status_code == 404:
-                    break  # no more parts for this country
-                if res.status_code != 200:
-                    logger.warning("Au1rxx %s part %d: HTTP %d", country_code, part, res.status_code)
-                    break
-                lines = decode_base64_content(res.text)
-                valid_lines = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
-                configs_by_country[country_name].extend(valid_lines)
-                fetched += len(valid_lines)
+                res = future.result()
+                if res.status_code == 200:
+                    lines = decode_base64_content(res.text)
+                    raw_lines.extend(lines)
+                    logger.info("Fetched %d lines from source %s", len(lines), url.split('/')[-1])
+                else:
+                    logger.warning("Original source %s returned HTTP %d", url, res.status_code)
             except Exception as e:
-                logger.warning("Au1rxx fetch error for %s (%s) part %d: %s", country_name, country_code, part, e)
-                break
-        if fetched:
-            logger.info("Fetched %d configs for %s (%s) from Au1rxx", fetched, country_name, country_code)
+                logger.warning("Original source read exception (%s): %s", url, e)
+    return raw_lines
 
+
+def _fetch_country_parts(country_code, country_name):
+    """Worker function to fetch all parts for a single country."""
+    valid_lines = []
+    for part in range(1, AU1RXX_PARTS + 1):
+        url = f"{AU1RXX_BASE}/{country_code}/v2ray-base64-{part:04d}.txt"
+        try:
+            res = http_get(url, timeout=12)
+            if res.status_code == 404:
+                break  # no more parts for this country
+            if res.status_code != 200:
+                logger.warning("Au1rxx %s part %d: HTTP %d", country_code, part, res.status_code)
+                break
+            lines = decode_base64_content(res.text)
+            part_lines = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+            valid_lines.extend(part_lines)
+        except Exception as e:
+            logger.warning("Au1rxx fetch error for %s (%s) part %d: %s", country_name, country_code, part, e)
+            break
+    return country_name, country_code, valid_lines
+
+
+def fetch_au1rxx_configs():
+    """Fetch v2ray configs from Au1rxx GitHub repo concurrently for all supported countries."""
+    configs_by_country = {country: [] for country in COUNTRY_DATA.keys()}
+    total_fetched = 0
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(_fetch_country_parts, code, name): (code, name)
+            for code, name in AU1RXX_COUNTRIES.items()
+        }
+        for future in as_completed(futures):
+            try:
+                c_name, c_code, lines = future.result()
+                if lines:
+                    configs_by_country[c_name].extend(lines)
+                    total_fetched += len(lines)
+            except Exception as e:
+                code, name = futures[future]
+                logger.warning("Error fetching Au1rxx configs for %s (%s): %s", name, code, e)
+
+    logger.info("Au1rxx concurrent fetch completed: %d total configs across countries", total_fetched)
     return configs_by_country
 
 
@@ -951,7 +1053,7 @@ def send_photo_safe(chat_id, photo, **kwargs):
 
 
 def post_to_channel(country_name, configs):
-    """Post configs for a country to the Telegram channel"""
+    """Post configs for a country to the Telegram channel using pre-saved file."""
     if not CHANNEL_ID:
         logger.warning("CHANNEL_ID not set, skipping channel post")
         return False
@@ -963,13 +1065,12 @@ def post_to_channel(country_name, configs):
     try:
         meta = COUNTRY_DATA.get(country_name, COUNTRY_DATA["Others"])
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-
-        txt_content = generate_txt_file(configs, country_name)
         filename = f"{meta['code'].lower()}_configs.txt"
+        filepath = script_dir / filename
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-            f.write(txt_content)
-            temp_path = f.name
+        if not filepath.exists():
+            txt_content = generate_txt_file(configs, country_name)
+            filepath.write_text(txt_content, encoding='utf-8')
 
         caption = (
             f"{meta['flag']} <b>{country_name}</b> - {total} Working Configs\n"
@@ -977,7 +1078,7 @@ def post_to_channel(country_name, configs):
             f"🔗 Channel: {CHANNEL_ID}"
         )
 
-        with open(temp_path, 'rb') as doc:
+        with open(filepath, 'rb') as doc:
             send_document_safe(
                 CHANNEL_ID,
                 doc,
@@ -986,7 +1087,6 @@ def post_to_channel(country_name, configs):
                 parse_mode="HTML"
             )
 
-        os.unlink(temp_path)
         logger.info("Posted %s (%d configs) to channel", country_name, total)
         return True
 
@@ -995,9 +1095,30 @@ def post_to_channel(country_name, configs):
         return False
 
 
+def get_best_font(size, bold=False):
+    """Try to load clean TrueType fonts from system, falling back to default."""
+    from PIL import ImageFont
+    candidates = [
+        "segoeuib.ttf" if bold else "segoeui.ttf",
+        "arialbd.ttf" if bold else "arial.ttf",
+        "calibrib.ttf" if bold else "calibri.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    for name in candidates:
+        try:
+            return ImageFont.truetype(name, size=size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
 def create_update_banner():
     """Generate a visual banner image summarizing the latest config update"""
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     width, height = 1280, 800
     img = Image.new("RGB", (width, height))
@@ -1010,22 +1131,17 @@ def create_update_banner():
         color = tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3))
         draw.line([(0, y), (width, y)], fill=color)
 
-    def font(size):
-        try:
-            return ImageFont.load_default(size=size)
-        except TypeError:
-            return ImageFont.load_default()
-
-    title_font = font(64)
-    sub_font = font(32)
-    small_font = font(26)
-    count_font = font(28)
+    title_font = get_best_font(64, bold=True)
+    sub_font = get_best_font(32)
+    small_font = get_best_font(24)
+    count_font = get_best_font(28, bold=True)
 
     draw.text((width // 2, 80), "LitixConnect", font=title_font, fill=(255, 255, 255), anchor="mm")
     draw.text((width // 2, 145), "Fresh VPN Configs Updated", font=sub_font, fill=(165, 180, 252), anchor="mm")
     draw.text((width // 2, 190), time.strftime("%Y-%m-%d  %H:%M UTC", time.gmtime()), font=small_font, fill=(148, 163, 184), anchor="mm")
 
-    entries = [(name, len(lines)) for name, lines in categorized_nodes.items() if lines and name != "Others"]
+    with nodes_lock:
+        entries = [(name, len(lines)) for name, lines in categorized_nodes.items() if lines and name != "Others"]
     entries.sort(key=lambda e: e[1], reverse=True)
 
     cols = 4
@@ -1044,7 +1160,8 @@ def create_update_banner():
     if len(entries) > 24:
         draw.text((width // 2, start_y + 6 * cell_h + 20), f"+{len(entries) - 24} more countries", font=small_font, fill=(148, 163, 184), anchor="mm")
 
-    total = sum(len(lines) for lines in categorized_nodes.values())
+    with nodes_lock:
+        total = sum(len(lines) for lines in categorized_nodes.values())
     draw.text((width // 2, height - 110), f"{total} verified configs across {len(entries)} countries", font=sub_font, fill=(255, 255, 255), anchor="mm")
     draw.text((width // 2, height - 55), CHANNEL_ID, font=small_font, fill=(165, 180, 252), anchor="mm")
 
@@ -1054,29 +1171,84 @@ def create_update_banner():
 
 
 def post_all_countries_to_channel():
-    """Post all countries with configs to the channel"""
-    logger.info("Posting all countries to channel %s...", CHANNEL_ID)
-    posted = 0
-    for country_name, lines in categorized_nodes.items():
-        if lines and country_name != "Others":
-            if post_to_channel(country_name, lines):
-                posted += 1
-                time.sleep(3.5)  # Telegram channels allow ~20 msgs/min; 3.5s keeps us under it
+    """Broadcast update to channel: header announcement with 1-tap configs, subscription, quick-picks, and country files."""
+    if not CHANNEL_ID:
+        logger.warning("CHANNEL_ID not set, skipping channel post")
+        return
 
+    with nodes_lock:
+        active_entries = [(name, list(lines)) for name, lines in categorized_nodes.items()
+                          if lines and name != "Others"]
+
+    if not active_entries:
+        logger.warning("No active configs to post to channel")
+        return
+
+    total_configs = sum(len(lines) for _, lines in active_entries)
+    logger.info("Broadcasting update to channel %s (%d configs across %d countries)...",
+                CHANNEL_ID, total_configs, len(active_entries))
+
+    timestamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+
+    # 1. Collect top 3 fastest configs across top countries for 1-tap mobile clipboard copy
+    top_3_configs = []
+    for _, lines in active_entries[:3]:
+        if lines:
+            top_3_configs.append(lines[0])
+
+    fastest_block = ""
+    if top_3_configs:
+        code_lines = "\n\n".join(f"<code>{html.escape(cfg)}</code>" for cfg in top_3_configs)
+        fastest_block = f"\n\n⚡ <b>Top Fastest Configs (Tap to Copy):</b>\n{code_lines}"
+
+    # 2. Generate and post update banner image as the main announcement
     try:
         banner_path = create_update_banner()
-        total = sum(len(lines) for lines in categorized_nodes.values())
-        caption = (
-            f"✅ <b>Update Complete!</b>\n"
-            f"📦 {total} verified configs posted across {posted} countries\n"
+        banner_caption = (
+            f"🚀 <b>LitixConnect | Fresh Config Update</b>\n"
+            f"📅 <b>Time:</b> {timestamp}\n"
+            f"📦 <b>Verified:</b> {total_configs} working configs across {len(active_entries)} countries\n"
+            f"⏱ <b>Push Schedule:</b> Every {UPDATE_INTERVAL_HOURS} Hours"
+            f"{fastest_block}\n\n"
+            f"💎 <b>سرورهای پرسرعت و بدون قطعی VIP با آی‌پی تمیز فعال شد!</b>\n"
+            f"📥 <i>فایل‌های رایگان کشورها و سابسکریپشن کامل در ادامه پیوست شده است.</i>\n"
             f"🔗 {CHANNEL_ID}"
         )
+        markup = None
+        if bot_username:
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                types.InlineKeyboardButton("💎 خرید کانفیگ اختصاصی VIP (بدون قطعی)", url=f"https://t.me/{bot_username}?start=buy"),
+                types.InlineKeyboardButton("🤖 ورود به ربات برای دریافت کانفیگ", url=f"https://t.me/{bot_username}")
+            )
+
         with open(banner_path, 'rb') as photo:
-            send_photo_safe(CHANNEL_ID, photo, caption=caption, parse_mode="HTML")
+            send_photo_safe(CHANNEL_ID, photo, caption=banner_caption, parse_mode="HTML", reply_markup=markup)
         logger.info("Posted update banner to channel")
+        time.sleep(3.5)
     except Exception as e:
         logger.warning("Failed to post update banner: %s", e)
 
+    # 3. Post all-in-one subscription file
+    try:
+        sub_content = generate_subscription_content()
+        if sub_content:
+            sub_name = "litixconnect_subscription.txt"
+            sub_path = script_dir / sub_name
+            sub_path.write_text(sub_content, encoding="utf-8")
+            caption = (
+                "📦 <b>All-in-One Subscription File</b>\n"
+                "Import this file in <b>v2rayNG</b> / <b>V2Box</b> / <b>Nekoray</b> / <b>Streisand</b> to load every verified config at once.\n\n"
+                f"🔗 {CHANNEL_ID}"
+            )
+            with open(sub_path, 'rb') as doc:
+                send_document_safe(CHANNEL_ID, doc, visible_file_name=sub_name, caption=caption, parse_mode="HTML")
+            logger.info("Posted combined subscription file to channel")
+            time.sleep(3.5)
+    except Exception as e:
+        logger.warning("Failed to post subscription file: %s", e)
+
+    # 4. Post top-5 quick picks file
     try:
         top_picks = build_top_picks()
         if top_picks:
@@ -1085,78 +1257,72 @@ def post_all_countries_to_channel():
                 "⚡ <b>Quick Picks - Top 5 Countries</b>\n"
                 f"{picks_line}\n\n"
                 "50 hand-picked configs per country, no duplicate servers - "
-                "a small file for users who don't want to scan the big ones.\n"
+                "a lightweight file for quick access.\n\n"
                 f"🔗 {CHANNEL_ID}"
             )
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-                f.write(top_picks["content"])
-                picks_path = f.name
+            picks_path = script_dir / "top5_quick_picks.txt"
+            picks_path.write_text(top_picks["content"], encoding="utf-8")
             with open(picks_path, 'rb') as doc:
                 send_document_safe(CHANNEL_ID, doc, visible_file_name="top5_quick_picks.txt",
                                    caption=caption, parse_mode="HTML")
-            os.unlink(picks_path)
             logger.info("Posted top-5 quick picks file to channel")
+            time.sleep(3.5)
     except Exception as e:
         logger.warning("Failed to post quick picks file: %s", e)
 
-    try:
-        sub_content = generate_subscription_content()
-        if sub_content:
-            sub_name = "litixconnect_subscription.txt"
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-                f.write(sub_content)
-                sub_path = f.name
-            caption = (
-                "📦 <b>All-in-one Subscription File</b>\n"
-                "Import this file in v2rayNG / V2Box / Nekoray to load every config at once.\n"
-                f"🔗 {CHANNEL_ID}"
-            )
-            with open(sub_path, 'rb') as doc:
-                send_document_safe(CHANNEL_ID, doc, visible_file_name=sub_name, caption=caption, parse_mode="HTML")
-            os.unlink(sub_path)
-            logger.info("Posted combined subscription file to channel")
-    except Exception as e:
-        logger.warning("Failed to post subscription file: %s", e)
+    # 5. Post individual country .txt files
+    posted_countries = 0
+    for country_name, lines in active_entries:
+        if post_to_channel(country_name, lines):
+            posted_countries += 1
+            time.sleep(3.5)
 
-    logger.info("Posted %d countries to channel", posted)
+    logger.info("Channel broadcast complete: %d country files posted", posted_countries)
+
+    # 6. Post a rotating Persian VIP feature announcement to channel
+    try:
+        announcement_idx = (int(time.time() // max(1, UPDATE_INTERVAL)) % len(persian_announcements.VIP_ANNOUNCEMENTS)) + 1
+        persian_announcements.send_persian_announcement(bot, CHANNEL_ID, bot_username, template_id=announcement_idx)
+    except Exception as e:
+        logger.warning("Failed to post rotating Persian VIP announcement: %s", e)
+
 
 # --- CORE ASYNCHRONOUS POOL ENGINE ---
 def seconds_until_next_aligned_slot(now=None):
-    """Wait until the next even UTC hour boundary (00:00, 02:00, 04:00 ...) so posts land on a predictable schedule."""
+    """Wait until the next aligned UTC hour boundary (e.g., 00:00, 12:00 UTC for 12h intervals)
+    so channel pushes land on a predictable schedule."""
     now = now or time.time()
     next_slot = (int(now // UPDATE_INTERVAL) + 1) * UPDATE_INTERVAL
     return max(1.0, next_slot - now)
+
+
+def get_next_update_time_str():
+    """Return human-readable UTC string of the next scheduled update time."""
+    next_timestamp = (int(time.time() // UPDATE_INTERVAL) + 1) * UPDATE_INTERVAL
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(next_timestamp))
 
 
 def update_configs_loop():
     global categorized_nodes, last_update_time
 
     while True:
-        logger.info("Starting high-speed concurrent configuration update...")
+        logger.info("Starting high-speed concurrent configuration update (interval: %dh)...", UPDATE_INTERVAL_HOURS)
+        cleanup_xray_temp_files()
         temp_storage = {k: [] for k in BUTTON_TO_COUNTRY.keys()}
-        raw_lines = []
         seen_keys = set()  # global dedup across ALL sources (same host:port never served twice)
 
-        # 1. Fetch from original sources
-        for url in SOURCES:
-            try:
-                res = http_get(url, timeout=10)
-                if res.status_code == 200:
-                    lines = decode_base64_content(res.text)
-                    raw_lines.extend(lines)
-                else:
-                    logger.warning("Original source %s returned HTTP %d", url, res.status_code)
-            except Exception as e:
-                logger.warning("Original source read exception: %s", e)
+        # 1. Concurrent fetch from original sources
+        logger.info("Fetching from original sources in parallel...")
+        raw_lines = fetch_sources_configs()
 
-        # 2. Fetch from Au1rxx GitHub (country-specific, multi-part)
-        logger.info("Fetching from Au1rxx GitHub repository...")
+        # 2. Concurrent fetch from Au1rxx GitHub (country-specific, multi-part)
+        logger.info("Fetching from Au1rxx GitHub repository across countries...")
         au1rxx_configs = fetch_au1rxx_configs()
         for country_name, lines in au1rxx_configs.items():
             if country_name in temp_storage:
                 temp_storage[country_name].extend(lines)
 
-        # 3. Test all unique configs from original sources
+        # 3. Test unique configs from original sources
         unique_original = []
         for line in raw_lines:
             line = line.strip()
@@ -1169,15 +1335,14 @@ def update_configs_loop():
                 seen_keys.add(key)
             unique_original.append(line)
 
-        logger.info("Discovered %d original nodes. Launching multi-threaded pipeline...", len(unique_original))
+        logger.info("Discovered %d original nodes. Launching verification pipeline...", len(unique_original))
 
-        # End-to-end verification requires the Xray binary; without it a scan
-        # can only produce TCP-open-but-dead nodes. Skip the whole sweep instead
-        # of publishing garbage - previous cache stays live until next attempt.
         exe = ensure_xray_binary()
         if exe is None:
-            logger.warning("Xray binary unavailable - SKIPPING scan (previous cache kept, %d configs). "
-                           "Retry in 10 min.", sum(len(v) for v in categorized_nodes.values()))
+            with nodes_lock:
+                cached_count = sum(len(v) for v in categorized_nodes.values())
+            logger.warning("Xray binary unavailable - SKIPPING scan (previous cache kept, %d configs). Retry in 10 min.",
+                           cached_count)
             time.sleep(600)
             continue
 
@@ -1193,8 +1358,8 @@ def update_configs_loop():
                     if result.get("latency") is not None:
                         latency_map[node_key(result["raw_line"])] = result["latency"]
 
-        # 4. Au1rxx configs: already country-sorted, test connectivity + dedup against everything above
-        logger.info("Testing Au1rxx pre-sorted configs...")
+        # 4. Au1rxx configs: pre-sorted, bypass redundant GeoIP, test connectivity
+        logger.info("Testing Au1rxx configs (%d countries)...", len(au1rxx_configs))
         for country_name, lines in au1rxx_configs.items():
             bucket_lines = []
             for line in lines:
@@ -1207,7 +1372,7 @@ def update_configs_loop():
             if not bucket_lines:
                 continue
             with ThreadPoolExecutor(max_workers=NODE_TEST_WORKERS) as executor:
-                futures = [executor.submit(test_single_node, line) for line in bucket_lines]
+                futures = [executor.submit(test_single_node, line, country_name) for line in bucket_lines]
                 for future in as_completed(futures):
                     result = future.result()
                     if result:
@@ -1220,8 +1385,10 @@ def update_configs_loop():
 
         # 5. Empty-scan guard: never wipe the channel's content because one source hiccupped
         if total_found == 0:
-            logger.warning("Scan found 0 live nodes - keeping previous cache (%d configs) and retrying sooner",
-                           sum(len(v) for v in categorized_nodes.values()))
+            with nodes_lock:
+                cached_count = sum(len(v) for v in categorized_nodes.values())
+            logger.warning("Scan found 0 live nodes - keeping previous cache (%d configs) and retrying in 2 min",
+                           cached_count)
             time.sleep(120)
             continue
 
@@ -1240,11 +1407,12 @@ def update_configs_loop():
             country_data_key = BUTTON_TO_COUNTRY[bucket]
             temp_storage[bucket] = [rebrand_config(line, country_data_key, idx) for idx, line in enumerate(lines, 1)]
 
-        categorized_nodes = temp_storage
-        last_update_time = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        with nodes_lock:
+            categorized_nodes = temp_storage
+            last_update_time = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
         # 7. Generate and save .txt files for each country
-        logger.info("Generating .txt files for each country...")
+        logger.info("Saving .txt files for each country...")
         for country_name, lines in categorized_nodes.items():
             if lines and country_name != "Others":
                 txt_content = generate_txt_file(lines, country_name)
@@ -1252,21 +1420,22 @@ def update_configs_loop():
                 filepath = script_dir / filename
                 try:
                     filepath.write_text(txt_content, encoding='utf-8')
-                    logger.info("Saved %d configs to %s", len(lines), filename)
                 except Exception as e:
                     logger.warning("Failed to save %s: %s", filename, e)
 
-        # 8. Persist state, then post to Telegram channel
+        # 8. Persist state, then broadcast to Telegram channel
         prune_offsets()
         save_state()
         post_all_countries_to_channel()
 
-        logger.info("Background sync complete. %d live nodes cached. Next sweep at the next even UTC hour.",
-                    total_found)
-        time.sleep(seconds_until_next_aligned_slot())
+        cleanup_xray_temp_files()
+        next_wait = seconds_until_next_aligned_slot()
+        logger.info("Background sync complete. %d live nodes cached. Next sweep in %.1f hours (at %s).",
+                    total_found, next_wait / 3600, get_next_update_time_str())
+        time.sleep(next_wait)
 
 
-# --- BOT COMMANDS ---
+# --- BOT COMMANDS & INTERACTIVE UI ---
 def build_country_inline_keyboard():
     """Inline keyboard: flag + name per button, 3 columns, Others last."""
     countries = [c for c in BUTTON_TO_COUNTRY.keys() if c != "Others"]
@@ -1279,57 +1448,214 @@ def build_country_inline_keyboard():
         ))
     buttons.append(types.InlineKeyboardButton("🌐 Others", callback_data="country:Others"))
     markup.add(*buttons)
+    markup.row(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"))
     return markup
+
+
+def build_main_menu_keyboard():
+    """Main bilingual interactive menu keyboard."""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("💎 خرید کانفیگ اختصاصی (VIP)", callback_data="menu:buy"),
+        types.InlineKeyboardButton("💖 حمایت مالی (Donation)", callback_data="menu:donate"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("🌐 کانفیگ‌های رایگان کشورها", callback_data="menu:free_countries"),
+        types.InlineKeyboardButton("⚡ ۵ کشور برتر (Top 5)", callback_data="menu:top"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("📦 سابسکریپشن رایگان", callback_data="menu:sub"),
+        types.InlineKeyboardButton("📊 وضعیت سرورها", callback_data="menu:status"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("📱 راهنمای اتصال و دانلود", callback_data="menu:guide"),
+        types.InlineKeyboardButton("👤 پیگیری سفارشات من", callback_data="menu:my_orders"),
+    )
+    return markup
+
+
+def get_welcome_text():
+    countries = [c for c in BUTTON_TO_COUNTRY.keys() if c != "Others"]
+    last_line = f"🕒 آخرین آپدیت رایگان: <code>{last_update_time}</code>" if last_update_time else "🕒 اولین اسکن در حال انجام..."
+    next_line = f"⏳ اسکن بعدی: <code>{get_next_update_time_str()}</code>"
+    verify_line = ("✅ تست زنده با هسته Xray-Core فعال است"
+                   if _xray_ready else "⚠️ تستر Xray موقتاً در حال آماده‌سازی است")
+
+    return (
+        f"👋 <b>به ربات هوشمند LitixConnect خوش آمدید!</b>\n\n"
+        f"این سرویس جامع برای دسترسی به اینترنت آزاد و پرسرعت طراحی شده است:\n\n"
+        f"1️⃣ <b>کانفیگ‌های رایگان و روزانه ({len(countries)} کشور):</b>\n"
+        f"اسکن، فیلتر و راستی‌آزمایی خودکار هر ۱۲ ساعت از معتبرترین سورس‌ها با پینگ واقعی.\n\n"
+        f"2️⃣ <b>سرورهای اختصاصی و پرسرعت VIP:</b>\n"
+        f"▫️ اتصال پایدار روی تمامی اپراتورها (همراه اول، ایرانسل، رایتل و نت خانگی)\n"
+        f"▫️ مجهز به تکنولوژی ضد فیلتر TLS Fragmentation و خروجی Direct IP\n"
+        f"▫️ آی‌پی تمیز و بدون قطعی مخصوص گیمینگ، استریم و هوش مصنوعی (ChatGPT/Gemini)\n"
+        f"▫️ مسیریابی هوشمند Iran-Safe (باز شدن مستقیم سایت‌های بانکی و ایرانی بدون قطع فیلترشکن)\n\n"
+        f"{last_line}\n{next_line}\n{verify_line}\n\n"
+        f"👇 <i>جهت ادامه یکی از گزینه‌های زیر را انتخاب فرمایید:</i>\n\n"
+        f"🔗 کانال رسمی تلگرام: {CHANNEL_ID}"
+    )
+
+
+def show_buy_menu(chat_id, message_id=None):
+    plans = get_vip_plans()
+    if not plans:
+        send_message_safe(chat_id, "⚠️ در حال حاضر هیچ پلنی فعال نیست. لطفاً بعداً مراجعه فرمایید.")
+        return
+
+    text = (
+        "💎 <b>پلن‌های اشتراک اختصاصی و پرسرعت VIP:</b>\n\n"
+        "تمامی کانفیگ‌های VIP بر بستر سرورهای اختصاصی با پروتکل امن VLESS+WS+TLS ارائه می‌شوند. "
+        "قابلیت فرگمنت اختصاصی روی خطوط همراه اول و ایرانسل تضمین شده است.\n\n"
+        "👇 <i>برای مشاهده جزئیات قیمت آنلاین و انتخاب روش پرداخت، پلن مورد نظر خود را لمس کنید:</i>"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for p in plans:
+        btn_title = f"⚡ {p['name_fa']} - ${p['price_usd']:.2f} USD ({p['volume_gb']}GB)"
+        markup.add(types.InlineKeyboardButton(btn_title, callback_data=f"plan_sel:{p['id']}"))
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"))
+
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+def show_donation_menu(chat_id, message_id=None):
+    text = (
+        "💖 <b>حمایت مالی از پروژه آزاد LitixConnect</b>\n\n"
+        "ما برای زنده نگه داشتن اینترنت آزاد، هر روز صدها سرور رایگان را اسکن و فیلتر می‌کنیم. "
+        "اجاره سرورهای قدرتمند تست و پنل‌های تانل هزینه‌های بالایی دارد. "
+        "اگر از سرویس‌های رایگان ما رضایت دارید، حمایت‌های کریپتویی شما انرژی‌بخش ادامه این مسیر خواهد بود:\n\n"
+        + crypto_manager.get_wallet_info_text()
+    )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🔺 بارکد QR ترون (TRX)", callback_data="donate_qr:tron"),
+        types.InlineKeyboardButton("🔹 بارکد QR اتریوم (ETH)", callback_data="donate_qr:eth"),
+    )
+    markup.row(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"))
+
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+def show_guide_menu(chat_id, message_id=None):
+    text = (
+        "📱 <b>راهنمای اتصال و دانلود برنامه‌های رسمی:</b>\n\n"
+        "🔹 <b>اندروید (Android):</b>\n"
+        "• نرم‌افزار پیشنهادی: <b>v2rayNG</b> (دانلود از گوگل پلی یا گیت‌هاب)\n"
+        "• راهنما: پس از کپی کردن لینک سابسکریپشن، وارد منوی ۳ خط ☰ شده، گزینه Subscription group setting را بزنید، "
+        "با زدن دکمه ➕ لینک را اضافه کنید و در صفحه اصلی با زدن ۳ نقطه روی Update subscription کلیک کنید.\n"
+        "• <b>رفع کندی روی همراه اول/ایرانسل:</b> در تنظیمات (Settings) برنامه، گزینه <b>Fragment</b> را روشن کنید.\n\n"
+        "🔹 <b>آیفون و آیپد (iOS):</b>\n"
+        "• نرم‌افزارهای پیشنهادی: <b>V2Box</b> یا <b>Streisand</b> یا <b>Shadowrocket</b> (از اپ استور)\n"
+        "• راهنما: در برنامه V2Box به بخش Configs رفته، ➕ را بزنید و Add Subscription را انتخاب کرده و لینک را پیست کنید.\n\n"
+        "🔹 <b>ویندوز (Windows):</b>\n"
+        "• نرم‌افزار پیشنهادی: <b>v2rayN</b> یا <b>Nekoray</b> یا <b>Sing-box</b>\n"
+        "• راهنما: از منوی Subscription Group گزینه Add را بزنید و لینک ساب را وارد نمایید.\n\n"
+        "💡 تمامی اشتراک‌های ما سازگار با هر دو نوع لینک استاندارد VLESS و سابسکریپشن Sing-box/Clash هستند."
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"))
+
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+def show_my_orders_menu(chat_id, user_id, message_id=None):
+    orders = order_mgr.get_user_orders(user_id)
+    if not orders:
+        text = "👤 <b>سفارش‌های شما:</b>\n\nشما هنوز هیچ سفارشی ثبت نکرده‌اید."
+    else:
+        lines = ["👤 <b>تاریخچه سفارش‌های شما:</b>\n"]
+        for o in orders[-5:]:
+            status_fa = {
+                "AWAITING_PAYMENT": "⏳ در انتظار واریز",
+                "PENDING_VERIFICATION": "🔍 در حال بررسی مدیریت",
+                "APPROVED": "✅ تایید و فعال شده",
+                "REJECTED": "❌ رد شده",
+            }.get(o["status"], o["status"])
+
+            line = f"▫️ کد سفارش: <code>{o['order_id']}</code> | پلن: <b>{o['plan_name']}</b>\n   وضعیت: {status_fa}"
+            if o.get("delivered_sub_url"):
+                line += f"\n   🔗 لینک سابسکریپشن: <code>{o['delivered_sub_url']}</code>"
+            lines.append(line)
+        text = "\n\n".join(lines)
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"))
+
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
 
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    countries = [c for c in BUTTON_TO_COUNTRY.keys() if c != "Others"]
-    last_line = f"🕒 Last update: {last_update_time}" if last_update_time else "🕒 First scan still in progress..."
-    verify_line = ("✅ End-to-end verified (real Xray-core handshakes)"
-                   if _xray_ready else "⚠️ Verifier degraded - Xray binary unavailable, cache may be stale")
+    parts = message.text.split()
+    if len(parts) > 1:
+        param = parts[1].lower()
+        if param == "buy":
+            show_buy_menu(message.chat.id)
+            return
+        elif param == "donate":
+            show_donation_menu(message.chat.id)
+            return
 
     bot.reply_to(
         message,
-        f"Welcome to the LitixConnect Service!\n\n"
-        f"📍 <b>{len(countries)} Countries Available</b> - tap one below to receive <b>3 fresh configs</b> "
-        f"plus the <b>full .txt file</b> with every config for that country.\n\n"
-        f"⚡ Short on time? Send <b>/top</b> for a small file with 50 diverse configs from each of the "
-        f"top 5 countries.\n"
-        f"📊 Send <b>/status</b> to see live counts per country.\n\n"
-        f"{last_line}\n{verify_line}\n"
-        f"🔗 Channel: {CHANNEL_ID}",
-        reply_markup=build_country_inline_keyboard(),
+        get_welcome_text(),
+        reply_markup=build_main_menu_keyboard(),
         parse_mode="HTML"
     )
 
 
 @bot.message_handler(commands=['status'])
 def send_status(message):
-    """Per-country counts + last update time so users know how fresh configs are."""
+    """Per-country counts + last and next update times."""
     lines = []
     total = 0
-    for country, nodes in categorized_nodes.items():
-        if country != "Others" and nodes:
-            meta = COUNTRY_DATA[country]
-            lines.append(f"{meta['flag']} {country}: <b>{len(nodes)}</b>")
-            total += len(nodes)
-    others = len(categorized_nodes.get("Others", []))
-    if others:
-        lines.append(f"🌐 Others: <b>{others}</b>")
-        total += others
+    with nodes_lock:
+        for country, nodes in categorized_nodes.items():
+            if country != "Others" and nodes:
+                meta = COUNTRY_DATA[country]
+                lines.append(f"{meta['flag']} {country}: <b>{len(nodes)}</b>")
+                total += len(nodes)
+        others = len(categorized_nodes.get("Others", []))
+        if others:
+            lines.append(f"🌐 Others: <b>{others}</b>")
+            total += others
 
     if not lines:
         body = "No configs cached yet - the first scan may still be running. Try again in a few minutes."
     else:
         body = "\n".join(lines)
 
-    last_line = f"🕒 Last update: {last_update_time}" if last_update_time else "🕒 First scan still in progress..."
+    last_line = f"🕒 Last update: {last_update_time}" if last_update_time else "🕒 First scan in progress..."
+    next_line = f"⏳ Next update: {get_next_update_time_str()}"
     verify_line = ("✅ End-to-end verified (real Xray-core handshakes)"
                    if _xray_ready else "⚠️ Verifier degraded - Xray binary unavailable, cache may be stale")
     bot.reply_to(
         message,
-        f"📊 <b>Current Cache Status</b>\n\n{body}\n\n📦 Total: {total} configs\n{last_line}\n{verify_line}\n🔗 Channel: {CHANNEL_ID}",
+        f"📊 <b>LitixConnect Cache Status</b>\n\n{body}\n\n📦 Total: {total} configs\n{last_line}\n{next_line}\n{verify_line}\n\n🔗 Channel: {CHANNEL_ID}",
         parse_mode="HTML"
     )
 
@@ -1348,7 +1674,8 @@ def manual_post(message):
 @bot.message_handler(commands=['top'])
 def send_top_picks(message):
     """On-demand top-5 quick picks file (small, diverse, no duplicate servers)"""
-    total = sum(len(v) for v in categorized_nodes.values())
+    with nodes_lock:
+        total = sum(len(v) for v in categorized_nodes.values())
     if total == 0:
         bot.reply_to(message, "⚠️ No configs cached yet - the first scan may still be running. Try again in a few minutes.")
         return
@@ -1359,12 +1686,12 @@ def send_top_picks(message):
         return
 
     picks_line = ", ".join(f"{COUNTRY_DATA[name]['flag']} {name} ×{n}" for name, n in top_picks["countries"])
+    picks_path = script_dir / "top5_quick_picks.txt"
     try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-            f.write(top_picks["content"])
-            temp_path = f.name
+        if not picks_path.exists():
+            picks_path.write_text(top_picks["content"], encoding="utf-8")
 
-        with open(temp_path, 'rb') as doc:
+        with open(picks_path, 'rb') as doc:
             send_document_safe(
                 message.chat.id,
                 doc,
@@ -1376,10 +1703,481 @@ def send_top_picks(message):
                 ),
                 parse_mode="HTML"
             )
-        os.unlink(temp_path)
     except Exception as e:
         logger.warning("Failed to send quick picks: %s", e)
         bot.reply_to(message, "⚠️ Couldn't send the quick picks file. Try again shortly.")
+
+
+@bot.message_handler(commands=['sub', 'subscription'])
+def send_subscription_file(message):
+    """Send all-in-one subscription file directly to user in chat."""
+    sub_content = generate_subscription_content()
+    if not sub_content:
+        bot.reply_to(message, "⚠️ No configs cached yet. Please try again shortly.")
+        return
+
+    sub_name = "litixconnect_subscription.txt"
+    sub_path = script_dir / sub_name
+    try:
+        sub_path.write_text(sub_content, encoding="utf-8")
+        caption = (
+            "📦 <b>All-in-One Subscription File</b>\n\n"
+            "Import this file into <b>v2rayNG</b>, <b>V2Box</b>, <b>Streisand</b>, or <b>Nekoray</b> "
+            "to load all verified configs at once.\n\n"
+            f"🔗 Channel: {CHANNEL_ID}"
+        )
+        with open(sub_path, 'rb') as doc:
+            send_document_safe(
+                message.chat.id,
+                doc,
+                visible_file_name=sub_name,
+                caption=caption,
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.warning("Failed to send subscription file: %s", e)
+        bot.reply_to(message, "⚠️ Could not send subscription file right now. Please try again.")
+
+
+@bot.message_handler(commands=['buy', 'vip', 'plans'])
+def cmd_buy(message):
+    show_buy_menu(message.chat.id)
+
+
+@bot.message_handler(commands=['donate', 'donation'])
+def cmd_donate(message):
+    show_donation_menu(message.chat.id)
+
+
+@bot.message_handler(commands=['admin_id', 'my_id'])
+def cmd_admin_id(message):
+    bot.reply_to(
+        message,
+        f"🆔 <b>شناسه عددی شما (Chat ID):</b> <code>{message.chat.id}</code>\n\n"
+        f"برای فعال‌سازی دسترسی مدیریت، این شناسه را در فایل <code>.env</code> مقابل <code>ADMIN_CHAT_ID</code> قرار دهید.",
+        parse_mode="HTML"
+    )
+
+
+@bot.message_handler(commands=['orders'])
+def cmd_orders(message):
+    is_admin = bool(ADMIN_CHAT_ID and str(message.chat.id) == str(ADMIN_CHAT_ID))
+    if is_admin:
+        pending = order_mgr.get_pending_orders()
+        if not pending:
+            bot.reply_to(message, "✅ در حال حاضر هیچ سفارش معلقی برای بررسی وجود ندارد.")
+            return
+
+        for o in pending[:5]:
+            text = (
+                f"🔔 <b>سفارش در انتظار تایید:</b>\n"
+                f"▫️ کد سفارش: <code>{o['order_id']}</code>\n"
+                f"▫️ کاربر: @{o['username']} (ID: <code>{o['user_id']}</code>)\n"
+                f"▫️ پلن: {o['plan_name']}\n"
+                f"▫️ مبلغ: {o['crypto_amount']} {o['crypto_currency']} ({o['crypto_network']})\n"
+                f"▫️ شناسه تراکنش (TxID): <code>{o.get('tx_hash', 'ثبت شده با عکس')}</code>"
+            )
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                types.InlineKeyboardButton("✅ تایید و صدور خودکار", callback_data=f"admin_approve:{o['order_id']}"),
+                types.InlineKeyboardButton("❌ رد سفارش", callback_data=f"admin_reject:{o['order_id']}"),
+            )
+            if o.get("photo_file_id"):
+                try:
+                    bot.send_photo(message.chat.id, o["photo_file_id"], caption=text, reply_markup=markup, parse_mode="HTML")
+                    continue
+                except Exception:
+                    pass
+            send_message_safe(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+    else:
+        show_my_orders_menu(message.chat.id, message.from_user.id)
+
+
+@bot.message_handler(commands=['post_vip', 'post_announcement'])
+def cmd_post_vip(message):
+    """Admin command to post a Persian feature announcement to the channel."""
+    if ADMIN_CHAT_ID and str(message.chat.id) != str(ADMIN_CHAT_ID):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+
+    parts = message.text.split()
+    tmpl_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+    if tmpl_id not in persian_announcements.VIP_ANNOUNCEMENTS:
+        tmpl_id = 1
+
+    ok = persian_announcements.send_persian_announcement(bot, CHANNEL_ID, bot_username, template_id=tmpl_id)
+    if ok:
+        bot.reply_to(message, f"📢 اعلان شماره {tmpl_id} با موفقیت به کانال ارسال شد.")
+    else:
+        bot.reply_to(message, "❌ خطا در ارسال اعلان به کانال. لاگ‌ها را بررسی کنید.")
+
+
+@bot.message_handler(commands=['announce'])
+def cmd_announce(message):
+    """Admin command to post custom Persian announcement with VIP CTA buttons."""
+    if ADMIN_CHAT_ID and str(message.chat.id) != str(ADMIN_CHAT_ID):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(
+            message,
+            "⚠️ لطفاً متن اعلان را وارد فرمایید:\n<code>/announce متن پیام اعلان شما</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    custom_text = parts[1].strip()
+    markup = persian_announcements.build_channel_vip_markup(bot_username)
+    try:
+        send_message_safe(CHANNEL_ID, custom_text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+        bot.reply_to(message, "📢 اعلان سفارشی با موفقیت به کانال ارسال شد.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ خطا در ارسال پیام به کانال: {e}")
+
+
+# --- MENU & ORDER CALLBACK QUERY HANDLERS ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("menu:"))
+def handle_menu_callbacks(call):
+    action = call.data.split(":", 1)[1]
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    if action == "main":
+        try:
+            bot.edit_message_text(get_welcome_text(), chat_id, msg_id, reply_markup=build_main_menu_keyboard(), parse_mode="HTML")
+        except Exception:
+            send_message_safe(chat_id, get_welcome_text(), reply_markup=build_main_menu_keyboard(), parse_mode="HTML")
+    elif action == "buy":
+        show_buy_menu(chat_id, msg_id)
+    elif action == "donate":
+        show_donation_menu(chat_id, msg_id)
+    elif action == "free_countries":
+        text = "📍 <b>لطفاً کشور مورد نظر خود را جهت دریافت ۳ کانفیگ تازه به همراه فایل کامل انتخاب کنید:</b>"
+        try:
+            bot.edit_message_text(text, chat_id, msg_id, reply_markup=build_country_inline_keyboard(), parse_mode="HTML")
+        except Exception:
+            send_message_safe(chat_id, text, reply_markup=build_country_inline_keyboard(), parse_mode="HTML")
+    elif action == "top":
+        send_top_picks(call.message)
+    elif action == "sub":
+        send_subscription_file(call.message)
+    elif action == "status":
+        send_status(call.message)
+    elif action == "guide":
+        show_guide_menu(chat_id, msg_id)
+    elif action == "my_orders":
+        show_my_orders_menu(chat_id, call.from_user.id, msg_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("donate_qr:"))
+def handle_donate_qr(call):
+    network = call.data.split(":", 1)[1]
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    if network == "tron":
+        addr = crypto_manager.TRON_WALLET
+        title = "شبکه ترون (Tron Network - TRX / USDT-TRC20)"
+    else:
+        addr = crypto_manager.ETH_WALLET
+        title = "شبکه اتریوم (Ethereum Network - ETH / USDT-ERC20)"
+
+    qr_bytes = crypto_manager.generate_qr_bytes(addr)
+    caption = (
+        f"💖 <b>بارکد واریز دونیت - {title}</b>\n\n"
+        f"📍 <b>آدرس کیف پول:</b>\n"
+        f"<code>{addr}</code>\n\n"
+        f"<i>(روی آدرس ضربه بزنید تا کپی شود)</i>\n"
+        f"از همراهی و حمایت شما بی‌نهایت سپاسگزاریم! 🙏"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به بخش حمایت مالی", callback_data="menu:donate"))
+    send_photo_safe(call.message.chat.id, qr_bytes, caption=caption, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("plan_sel:"))
+def handle_plan_selection(call):
+    plan_id = call.data.split(":", 1)[1]
+    plans = {p["id"]: p for p in get_vip_plans()}
+    plan = plans.get(plan_id)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    if not plan:
+        send_message_safe(call.message.chat.id, "⚠️ پلن مورد نظر یافت نشد.")
+        return
+
+    calc = crypto_manager.calculate_adaptive_prices(plan["price_usd"])
+    text = (
+        f"💎 <b>جزئیات و انتخاب روش پرداخت برای {plan['name_fa']}:</b>\n\n"
+        f"▫️ <b>حجم ترافیک:</b> {plan['volume_gb']} گیگابایت\n"
+        f"▫️ <b>مدت اعتبار:</b> {plan['duration_days']} روز\n"
+        f"▫️ <b>تعداد کاربر همزمان:</b> {plan['devices']} دستگاه\n"
+        f"▫️ <b>مشخصات:</b> {plan.get('description_fa', '')}\n\n"
+        f"💰 <b>مبلغ قابل پرداخت (محاسبه آنلاین با نرخ لحظه‌ای بازار):</b>\n"
+        f"💵 <b>معادل تتر (USDT):</b> ${calc['usdt']:.2f} USDT\n"
+        f"🔺 <b>معادل ترون (TRX):</b> ~{calc['trx']} TRX\n"
+        f"🔹 <b>معادل اتریوم (ETH):</b> ~{calc['eth']} ETH\n\n"
+        f"👇 <i>لطفاً شبکه انتقال رمزارز مورد نظر خود را انتخاب نمایید:</i>"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(f"🔺 پرداخت در شبکه ترون (TRX / USDT-TRC20)", callback_data=f"pay_net:{plan_id}:tron"),
+        types.InlineKeyboardButton(f"🔹 پرداخت در شبکه اتریوم (ETH / USDT-ERC20)", callback_data=f"pay_net:{plan_id}:eth"),
+        types.InlineKeyboardButton("🔙 بازگشت به لیست پلن‌ها", callback_data="menu:buy")
+    )
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        send_message_safe(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_net:"))
+def handle_payment_network(call):
+    _, plan_id, network = call.data.split(":", 2)
+    plans = {p["id"]: p for p in get_vip_plans()}
+    plan = plans.get(plan_id)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    if not plan:
+        send_message_safe(call.message.chat.id, "⚠️ پلن مورد نظر یافت نشد.")
+        return
+
+    calc = crypto_manager.calculate_adaptive_prices(plan["price_usd"])
+
+    if network == "tron":
+        wallet_address = crypto_manager.TRON_WALLET
+        net_title = "شبکه ترون (Tron Network - TRC20)"
+        crypto_curr = "TRX / USDT-TRC20"
+        amount_str = f"<b>{calc['trx']} TRX</b> یا <b>${calc['usdt']:.2f} USDT-TRC20</b>"
+        crypto_amount = calc['trx']
+    else:
+        wallet_address = crypto_manager.ETH_WALLET
+        net_title = "شبکه اتریوم (Ethereum Network - ERC20)"
+        crypto_curr = "ETH / USDT-ERC20"
+        amount_str = f"<b>{calc['eth']} ETH</b> یا <b>${calc['usdt']:.2f} USDT-ERC20</b>"
+        crypto_amount = calc['eth']
+
+    # Create order in order_manager
+    order_id = order_mgr.create_order(
+        user_id=call.from_user.id,
+        username=call.from_user.username,
+        first_name=call.from_user.first_name,
+        plan=plan,
+        crypto_network=net_title,
+        crypto_currency=crypto_curr,
+        crypto_amount=crypto_amount,
+    )
+
+    qr_bytes = crypto_manager.generate_qr_bytes(wallet_address)
+    caption = (
+        f"🧾 <b>فاکتور پرداخت سفارش <code>{order_id}</code></b>\n\n"
+        f"📦 <b>پلن:</b> {plan['name_fa']} ({plan['volume_gb']}GB - {plan['duration_days']} روز)\n"
+        f"🌐 <b>شبکه انتقال:</b> {net_title}\n"
+        f"💰 <b>مبلغ قابل واریز:</b> {amount_str}\n\n"
+        f"📍 <b>آدرس کیف پول جهت واریز:</b>\n"
+        f"<code>{wallet_address}</code>\n"
+        f"<i>(روی آدرس ضربه بزنید تا کپی شود)</i>\n\n"
+        f"⚠️ <b>راهنمای تکمیل خرید:</b>\n"
+        f"۱. مبلغ مشخص‌شده را به آدرس بالا انتقال دهید.\n"
+        f"۲. پس از انجام انتقال، دکمه <b>«ثبت کد پیگیری / رسید»</b> را بزنید و کد هش (TxID) یا عکس رسید را ارسال نمایید.\n"
+        f"۳. پس از تایید مدیریت، کانفیگ اختصاصی شما به صورت خودکار صادر خواهد شد."
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("✅ ثبت رسید / شناسه تراکنش (TxID)", callback_data=f"submit_tx:{order_id}"),
+        types.InlineKeyboardButton("🔙 انصراف و بازگشت به پلن‌ها", callback_data="menu:buy")
+    )
+    send_photo_safe(call.message.chat.id, qr_bytes, caption=caption, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("submit_tx:"))
+def handle_submit_tx(call):
+    order_id = call.data.split(":", 1)[1]
+    chat_id = call.message.chat.id
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    user_pending_tx_order[chat_id] = order_id
+    text = (
+        f"📥 <b>ارسال مدرک پرداخت برای سفارش <code>{order_id}</code>:</b>\n\n"
+        f"لطفاً در پاسخ به این پیام، <b>کد پیگیری تراکنش (TxID / Hash)</b> یا <b>عکس اسکرین‌شات رسید واریز</b> را ارسال فرمایید.\n\n"
+        f"<i>(سیستم به صورت خودکار رسید شما را دریافت و به مدیریت ارسال می‌کند)</i>"
+    )
+    send_message_safe(chat_id, text, parse_mode="HTML")
+
+
+# --- ADMIN ORDER APPROVAL / REJECTION CALLBACKS ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_approve:") or call.data.startswith("admin_reject:"))
+def handle_admin_decision(call):
+    is_admin = bool(not ADMIN_CHAT_ID or str(call.message.chat.id) == str(ADMIN_CHAT_ID) or str(call.from_user.id) == str(ADMIN_CHAT_ID))
+    if not is_admin:
+        try:
+            bot.answer_callback_query(call.id, "⛔ شما دسترسی مدیریت ندارید.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    action, order_id = call.data.split(":", 1)
+    order = order_mgr.get_order(order_id)
+    if not order:
+        try:
+            bot.answer_callback_query(call.id, "⚠️ سفارش یافت نشد.")
+        except Exception:
+            pass
+        return
+
+    if order["status"] == "APPROVED":
+        try:
+            bot.answer_callback_query(call.id, "این سفارش قبلاً تایید شده است.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    if action == "admin_reject":
+        order_mgr.reject_order(order_id, reason="رد توسط ادمین")
+        try:
+            bot.answer_callback_query(call.id, f"سفارش {order_id} رد شد.")
+        except Exception:
+            pass
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        send_message_safe(order["user_id"], f"❌ سفارش <code>{order_id}</code> توسط مدیریت تایید نشد. در صورت بروز هرگونه مشکل با پشتیبانی در ارتباط باشید.", parse_mode="HTML")
+        return
+
+    # admin_approve: create client on conpanel (3x-ui)
+    try:
+        bot.answer_callback_query(call.id, f"در حال ایجاد کانفیگ برای {order_id}...")
+    except Exception:
+        pass
+
+    email_tag = f"tg_{order['user_id']}_{order_id.lower().replace('-', '_')}"
+    creation_res = conpanel_mgr.create_customer_subscription(
+        email=email_tag,
+        total_gb=order["volume_gb"],
+        expiry_days=order["duration_days"],
+        limit_hwid=order.get("devices", 1),
+        tg_id=order["user_id"]
+    )
+
+    if not creation_res.get("success"):
+        err_msg = creation_res.get("error", "Unknown panel error")
+        logger.error("Failed to auto-create client for %s: %s", order_id, err_msg)
+        send_message_safe(call.message.chat.id, f"❌ خطا در ساخت کانفیگ روی سرور برای سفارش {order_id}: {err_msg}")
+        return
+
+    sub_url = creation_res["sub_url"]
+    json_url = creation_res["json_url"]
+    order_mgr.approve_order(order_id, sub_url)
+
+    # Deliver to customer
+    try:
+        qr_bytes = crypto_manager.generate_qr_bytes(sub_url)
+        cust_msg = (
+            f"🎉 <b>سفارش شما با موفقیت تایید و فعال شد!</b>\n\n"
+            f"🆔 <b>کد پیگیری:</b> <code>{order_id}</code>\n"
+            f"📦 <b>پلن:</b> {order['plan_name']}\n"
+            f"📊 <b>حجم ترافیک:</b> {order['volume_gb']} گیگابایت\n"
+            f"⏳ <b>مدت اعتبار:</b> {order['duration_days']} روز\n"
+            f"👥 <b>تعداد کاربر مجاز:</b> {order.get('devices', 1)} دستگاه\n\n"
+            f"🔗 <b>لینک سابسکریپشن اختصاصی شما (برای کپی لمس کنید):</b>\n"
+            f"<code>{sub_url}</code>\n\n"
+            f"📱 <b>لینک سابسکریپشن مخصوص Sing-box / Clash:</b>\n"
+            f"<code>{json_url}</code>\n\n"
+            f"💡 <b>راهنمای اتصال:</b>\n"
+            f"۱. لینک فوق را کپی کنید یا بارکد QR زیر را در برنامه اسکن فرمایید.\n"
+            f"۲. در برنامه <b>v2rayNG</b> یا <b>V2Box</b> یا <b>Streisand</b> به بخش Subscription رفته و Update را بزنید.\n"
+            f"۳. <b>نکته مهم برای همراه اول و ایرانسل:</b> در صورت اختلال، در تنظیمات برنامه گزینه <b>Fragment</b> را فعال نمایید.\n\n"
+            f"از اعتماد شما به LitixConnect سپاسگزاریم! ❤️"
+        )
+        send_photo_safe(order["user_id"], qr_bytes, caption=cust_msg, parse_mode="HTML")
+    except Exception as e:
+        logger.error("Failed to deliver subscription to user %s: %s", order["user_id"], e)
+        send_message_safe(order["user_id"], f"✅ کانفیگ شما ساخته شد:\n<code>{sub_url}</code>", parse_mode="HTML")
+
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    send_message_safe(call.message.chat.id, f"✅ سفارش <code>{order_id}</code> با موفقیت تایید شد و لینک برای کاربر ارسال گردید.", parse_mode="HTML")
+
+
+# --- USER PAYMENT RECEIPT LISTENER (Photo or Text TxID) ---
+@bot.message_handler(content_types=['text', 'photo'], func=lambda m: m.chat.id in user_pending_tx_order)
+def handle_payment_receipt_upload(message):
+    chat_id = message.chat.id
+    order_id = user_pending_tx_order.pop(chat_id, None)
+    if not order_id:
+        return
+
+    order = order_mgr.get_order(order_id)
+    if not order:
+        bot.reply_to(message, "⚠️ سفارش معتبری یافت نشد.")
+        return
+
+    tx_hash = None
+    photo_file_id = None
+
+    if message.content_type == 'photo':
+        photo_file_id = message.photo[-1].file_id
+        tx_hash = message.caption or "ارسالی از طریق عکس رسید"
+    else:
+        tx_hash = message.text.strip()
+
+    order_mgr.submit_payment_proof(order_id, tx_hash=tx_hash, photo_file_id=photo_file_id)
+
+    # Confirm to user
+    bot.reply_to(
+        message,
+        f"✅ <b>رسید پرداخت شما برای سفارش <code>{order_id}</code> دریافت شد!</b>\n\n"
+        f"اطلاعات پرداخت جهت تایید به مدیریت ارسال گردید. "
+        f"به محض تایید، کانفیگ اختصاصی شما به صورت خودکار در همین چت تحویل داده خواهد شد. "
+        f"از صبوری شما سپاسگزاریم! 🙏",
+        parse_mode="HTML"
+    )
+
+    # Dispatch alert to Admin
+    target_admin_chat = ADMIN_CHAT_ID if ADMIN_CHAT_ID else chat_id
+    admin_alert = (
+        f"🔔 <b>رسید پرداخت جدید دریافت شد!</b>\n\n"
+        f"🆔 <b>شناسه سفارش:</b> <code>{order_id}</code>\n"
+        f"👤 <b>کاربر:</b> @{order['username']} (ID: <code>{order['user_id']}</code> | نام: {order['first_name']})\n"
+        f"📦 <b>پلن انتخابی:</b> {order['plan_name']} ({order['volume_gb']}GB / {order['duration_days']} روز)\n"
+        f"🌐 <b>شبکه:</b> {order['crypto_network']}\n"
+        f"💰 <b>مبلغ مورد انتظار:</b> {order['crypto_amount']} {order['crypto_currency']}\n"
+        f"🔗 <b>شناسه تراکنش (TxID):</b>\n<code>{tx_hash}</code>"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ تایید و صدور خودکار", callback_data=f"admin_approve:{order_id}"),
+        types.InlineKeyboardButton("❌ رد سفارش", callback_data=f"admin_reject:{order_id}"),
+    )
+
+    if photo_file_id:
+        try:
+            bot.send_photo(target_admin_chat, photo_file_id, caption=admin_alert, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception as e:
+            logger.warning("Could not send receipt photo to admin: %s", e)
+
+    send_message_safe(target_admin_chat, admin_alert, reply_markup=markup, parse_mode="HTML")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("country:"))
@@ -1402,7 +2200,8 @@ def handle_legacy_keyboard(message):
 
 
 def serve_country_to_chat(chat_id, selected_button):
-    master_nodes_list = categorized_nodes.get(selected_button, [])
+    with nodes_lock:
+        master_nodes_list = list(categorized_nodes.get(selected_button, []))
     total_available = len(master_nodes_list)
 
     if total_available == 0:
@@ -1416,7 +2215,7 @@ def serve_country_to_chat(chat_id, selected_button):
     with offsets_lock:
         if chat_id not in user_session_offsets:
             user_session_offsets[chat_id] = {k: 0 for k in BUTTON_TO_COUNTRY.keys()}
-        current_offset = user_session_offsets[chat_id][selected_button]
+        current_offset = user_session_offsets[chat_id].get(selected_button, 0)
 
     inform_msg = ""
 
@@ -1438,24 +2237,25 @@ def serve_country_to_chat(chat_id, selected_button):
     with offsets_lock:
         user_session_offsets[chat_id][selected_button] = start_idx + served_count
 
-    # Send the 3 configs as a monospace text block (plain text - no parse errors possible)
-    response_text = f"{inform_msg}✨ <b>Your 3 Verified Configs for {selected_button}:</b>\n\n"
+    meta = COUNTRY_DATA.get(selected_button, COUNTRY_DATA["Others"])
+
+    # Send introductory notice
+    response_text = f"{inform_msg}✨ <b>Your 3 Verified Configs for {meta['flag']} {selected_button} (Tap to Copy):</b>"
     bot.send_message(chat_id, response_text, parse_mode="HTML")
 
+    # Send each config inside a code block for 1-tap copy on mobile Telegram
     for node in nodes_to_serve:
-        # plain text, no parse mode: configs can contain any characters without breaking Telegram
-        bot.send_message(chat_id, node)
+        send_message_safe(chat_id, f"<code>{html.escape(node)}</code>", parse_mode="HTML")
 
-    # Also send the full .txt file
-    txt_content = generate_txt_file(master_nodes_list, selected_button)
-    filename = f"{COUNTRY_DATA[selected_button]['code'].lower()}_configs.txt"
+    # Send full .txt file from disk
+    filename = f"{meta['code'].lower()}_configs.txt"
+    filepath = script_dir / filename
+    if not filepath.exists():
+        txt_content = generate_txt_file(master_nodes_list, selected_button)
+        filepath.write_text(txt_content, encoding='utf-8')
 
     try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-            f.write(txt_content)
-            temp_path = f.name
-
-        with open(temp_path, 'rb') as doc:
+        with open(filepath, 'rb') as doc:
             send_document_safe(
                 chat_id,
                 doc,
@@ -1467,20 +2267,41 @@ def serve_country_to_chat(chat_id, selected_button):
                 ),
                 parse_mode="HTML"
             )
-
-        os.unlink(temp_path)
     except Exception as e:
         logger.warning("Failed to send .txt file: %s", e)
 
 
 if __name__ == "__main__":
+    cleanup_xray_temp_files()
     load_state()
+
+    try:
+        me = bot.get_me()
+        bot_username = me.username
+        logger.info("Connected to Telegram Bot: @%s (ID: %s)", bot_username, me.id)
+    except Exception as e:
+        logger.warning("Could not fetch bot identity: %s", e)
+
+    # Register Bot Menu Commands with Telegram
+    try:
+        bot.set_my_commands([
+            types.BotCommand("start", "منوی اصلی ربات | Main Menu"),
+            types.BotCommand("buy", "خرید کانفیگ اختصاصی VIP | Buy VIP"),
+            types.BotCommand("donate", "حمایت مالی از سرورها | Donation"),
+            types.BotCommand("orders", "پیگیری سفارشات من | My Orders"),
+            types.BotCommand("top", "دریافت فایل ۵ کشور برتر | Top 5"),
+            types.BotCommand("sub", "سابسکریپشن همگانی رایگان | All-in-One Sub"),
+            types.BotCommand("status", "وضعیت سرورهای رایگان | Server Status"),
+            types.BotCommand("help", "راهنمای اتصال و دانلود برنامه‌ها | Guide"),
+        ])
+        logger.info("Registered Telegram bot commands menu")
+    except Exception as e:
+        logger.warning("Failed to register bot commands: %s", e)
 
     updater_thread = threading.Thread(target=update_configs_loop, daemon=True)
     updater_thread.start()
 
     logger.info("Resilient Telegram operational routing loop initializing...")
-    # surface verifier state right away so a degraded deploy is visible in logs
     threading.Thread(target=ensure_xray_binary, daemon=True).start()
     while True:
         try:

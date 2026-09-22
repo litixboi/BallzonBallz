@@ -7,3 +7,6 @@ bot_state.json
 update_banner.png
 litixconnect_subscription.txt
 xray_bin/
+orders.json
+test_integration.py
+.claude/

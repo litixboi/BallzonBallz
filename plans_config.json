@@ -1,0 +1,42 @@
+[
+  {
+    "id": "plan_basic_30gb",
+    "name_fa": "پلن پایه (یک ماهه)",
+    "name_en": "Basic Plan (1 Month)",
+    "volume_gb": 30,
+    "duration_days": 30,
+    "devices": 1,
+    "price_usd": 3.0,
+    "description_fa": "⚡ حجم ۳۰ گیگابایت | ۱ ماهه | ۱ کاربره | آی‌پی تمیز آلمان و هلند | بدون قطعی روی تمام اپراتورها"
+  },
+  {
+    "id": "plan_silver_60gb",
+    "name_fa": "پلن نقره‌ای (یک ماهه)",
+    "name_en": "Silver Plan (1 Month)",
+    "volume_gb": 60,
+    "duration_days": 30,
+    "devices": 2,
+    "price_usd": 5.0,
+    "description_fa": "⚡ حجم ۶۰ گیگابایت | ۱ ماهه | ۲ کاربره | مناسب مصارف روزمره و اینستاگرام و یوتیوب | پشتیبانی ۲۴ ساعته"
+  },
+  {
+    "id": "plan_gold_100gb",
+    "name_fa": "پلن طلایی (یک ماهه)",
+    "name_en": "Gold Plan (1 Month)",
+    "volume_gb": 100,
+    "duration_days": 30,
+    "devices": 2,
+    "price_usd": 8.0,
+    "description_fa": "⚡ حجم ۱۰۰ گیگابایت | ۱ ماهه | ۲ کاربره | سرعت توربو مخصوص گیمینگ و استریم 4K | دسترسی به ChatGPT و هوش مصنوعی"
+  },
+  {
+    "id": "plan_diamond_200gb",
+    "name_fa": "پلن الماس (سه ماهه)",
+    "name_en": "Diamond Plan (3 Months)",
+    "volume_gb": 200,
+    "duration_days": 90,
+    "devices": 3,
+    "price_usd": 15.0,
+    "description_fa": "⚡ حجم ۲۰۰ گیگابایت | ۳ ماهه اقتصادی | ۳ کاربره همزمان | اتصال پایدار و دائمی | تخفیف ویژه کریپتو"
+  }
+]
