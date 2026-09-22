@@ -31,7 +31,7 @@ from telebot.apihelper import ApiTelegramException
 import geoip2.database
 
 import crypto_manager
-from conpanel_api import conpanel_mgr
+from conpanel_api import conpanel_mgr, BRIDGE_DOMAIN
 from order_manager import order_mgr
 import persian_announcements
 
@@ -2127,8 +2127,10 @@ def handle_view_order(call):
                 lines.append(f"📊 <b>حجم کل:</b> {order.get('volume_gb', 30)} گیگابایت | {dur_str}")
 
             lines.append(f"🔗 <b>لینک ساب اصلی (Primary):</b>\n<code>{html.escape(s.get('sub_url', ''))}</code>")
-            if s.get("bridge_url"):
-                lines.append(f"🌉 <b>لینک ساب کمکی (Bridge Sub):</b>\n<code>{html.escape(s['bridge_url'])}</code>")
+            bridge_u = s.get("bridge_url")
+            if bridge_u:
+                bridge_u = bridge_u.replace("bridge.litontheix.ir", BRIDGE_DOMAIN)
+                lines.append(f"🌉 <b>لینک ساب کمکی (Mirror / Bridge):</b>\n<code>{html.escape(bridge_u)}</code>")
             if s.get("json_url"):
                 lines.append(f"📱 <b>لینک Sing-box / Clash:</b>\n<code>{html.escape(s['json_url'])}</code>")
 
@@ -2886,8 +2888,10 @@ def handle_admin_decision(call):
             lines.append("━━━━━━━━━━━━━━━━━━━")
             lines.append(f"🔑 <b>اشتراک{num_str}:</b>")
             lines.append(f"🔗 <b>لینک ساب اصلی:</b>\n<code>{html.escape(sub['sub_url'])}</code>")
-            if sub.get("bridge_url"):
-                lines.append(f"🌉 <b>لینک ساب کمکی (Bridge Sub):</b>\n<code>{html.escape(sub['bridge_url'])}</code>")
+            bridge_u = sub.get("bridge_url")
+            if bridge_u:
+                bridge_u = bridge_u.replace("bridge.litontheix.ir", BRIDGE_DOMAIN)
+                lines.append(f"🌉 <b>لینک ساب کمکی (Mirror / Bridge):</b>\n<code>{html.escape(bridge_u)}</code>")
             if sub.get("json_url"):
                 lines.append(f"📱 <b>لینک مخصوص Sing-box:</b>\n<code>{html.escape(sub['json_url'])}</code>")
 

@@ -24,7 +24,7 @@ CON_BASE = os.getenv("CONPANEL_URL", DEFAULT_BASE).rstrip("/")
 CON_USER = os.getenv("CONPANEL_USER", DEFAULT_USER)
 CON_PASS = os.getenv("CONPANEL_PASS", DEFAULT_PASS)
 PUBLIC_DOMAIN = os.getenv("CONPANEL_DOMAIN", "conpanel.litontheix.ir")
-BRIDGE_DOMAIN = os.getenv("CONPANEL_BRIDGE_DOMAIN", os.getenv("BRIDGE_DOMAIN", "bridge.litontheix.ir"))
+BRIDGE_DOMAIN = os.getenv("CONPANEL_BRIDGE_DOMAIN", os.getenv("BRIDGE_DOMAIN", "conpanel.85-10-197-124.nip.io"))
 
 
 class ConpanelClient:
