@@ -8,6 +8,5 @@ update_banner.png
 litixconnect_subscription.txt
 xray_bin/
 orders.json
-admin_chat_registry.json
 test_integration.py
 .claude/
