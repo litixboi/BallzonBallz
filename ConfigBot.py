@@ -9,6 +9,7 @@ import os
 import queue
 import random
 import re
+import secrets
 import socket
 import subprocess
 import tempfile
@@ -2012,25 +2013,38 @@ def show_guide_menu(chat_id, message_id=None):
 
 def show_my_orders_menu(chat_id, user_id, message_id=None):
     orders = order_mgr.get_user_orders(user_id)
-    if not orders:
-        text = "👤 <b>سفارش‌های شما:</b>\n\nشما هنوز هیچ سفارشی ثبت نکرده‌اید."
-    else:
-        lines = ["👤 <b>تاریخچه سفارش‌های شما:</b>\n"]
-        for o in orders[-5:]:
-            status_fa = {
-                "AWAITING_PAYMENT": "⏳ در انتظار واریز",
-                "PENDING_VERIFICATION": "🔍 در حال بررسی مدیریت",
-                "APPROVED": "✅ تایید و فعال شده",
-                "REJECTED": "❌ رد شده",
-            }.get(o["status"], o["status"])
-
-            line = f"▫️ کد سفارش: <code>{o['order_id']}</code> | پلن: <b>{o['plan_name']}</b>\n   وضعیت: {status_fa}"
-            if o.get("delivered_sub_url"):
-                line += f"\n   🔗 لینک سابسکریپشن: <code>{o['delivered_sub_url']}</code>"
-            lines.append(line)
-        text = "\n\n".join(lines)
-
     markup = types.InlineKeyboardMarkup(row_width=1)
+    if not orders:
+        text = (
+            "👤 <b>سفارش‌های شما:</b>\n\n"
+            "شما هنوز هیچ سفارشی ثبت نکرده‌اید.\n"
+            "برای مشاهده پلن‌های پرسرعت و اختصاصی، دکمه زیر را لمس نمایید:"
+        )
+        markup.add(types.InlineKeyboardButton("💎 خرید اشتراک اختصاصی (VIP)", callback_data="menu:buy"))
+    else:
+        text = (
+            f"👤 <b>پیگیری سفارشات من ({len(orders)} سفارش ثبت شده):</b>\n\n"
+            "👇 <i>برای مشاهده وضعیت سفارش، لینک‌های سابسکریپشن (اصلی و کمکی Bridge)، حجم مصرفی لحظه‌ای و بارکد QR، روی سفارش مورد نظر کلیک فرمایید:</i>"
+        )
+        for o in reversed(orders[-8:]):
+            st = o.get("status", "UNKNOWN")
+            status_icon = {
+                "APPROVED": "✅",
+                "PENDING_VERIFICATION": "🔍",
+                "AWAITING_PAYMENT": "⏳",
+                "REJECTED": "❌",
+            }.get(st, "▫️")
+            status_label = {
+                "APPROVED": "فعال",
+                "PENDING_VERIFICATION": "بررسی فیش",
+                "AWAITING_PAYMENT": "در انتظار پرداخت",
+                "REJECTED": "رد شده",
+            }.get(st, st)
+            qty = o.get("quantity", 1)
+            qty_label = f" ({qty} عدد)" if qty > 1 else ""
+            btn_title = f"{status_icon} سفارش {o['order_id']} | {o.get('volume_gb', 0)}GB{qty_label} [{status_label}]"
+            markup.add(types.InlineKeyboardButton(btn_title, callback_data=f"view_order:{o['order_id']}"))
+
     markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"))
 
     if message_id:
@@ -2040,6 +2054,212 @@ def show_my_orders_menu(chat_id, user_id, message_id=None):
         except Exception:
             pass
     send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("view_order:"))
+def handle_view_order(call):
+    order_id = call.data.split(":", 1)[1]
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    order = order_mgr.get_order(order_id)
+    if not order:
+        send_message_safe(chat_id, "⚠️ سفارش مورد نظر یافت نشد.")
+        return
+
+    # IDOR Check: Ensure user owns this order
+    if order.get("user_id") != user_id:
+        send_message_safe(chat_id, "⛔ شما مجاز به مشاهده این سفارش نیستید.")
+        return
+
+    st = order.get("status", "UNKNOWN")
+    qty = order.get("quantity", 1)
+    dur_days = order.get("duration_days", 30)
+    dur_map = {30: "۱ ماهه", 90: "۳ ماهه", 180: "۶ ماهه"}
+    dur_str = dur_map.get(dur_days, f"{dur_days} روز")
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    if st == "APPROVED":
+        delivered_subs = order.get("delivered_subs") or []
+        if not delivered_subs and order.get("delivered_sub_url"):
+            delivered_subs = [{"sub_url": order["delivered_sub_url"]}]
+
+        lines = [
+            f"✅ <b>جزئیات سفارش فعال <code>{html.escape(order_id)}</code></b>\n",
+            f"📦 <b>پلن:</b> {html.escape(str(order.get('plan_name', 'VIP')))}",
+            f"🔢 <b>تعداد اشتراک:</b> {qty} عدد",
+            f"👥 <b>دستگاه مجاز هر اشتراک:</b> {order.get('devices', 1)} کاربره",
+            f"📅 <b>تاریخ ثبت:</b> <code>{order.get('created_at', '-')}</code>",
+            f"⚡ <b>تاریخ فعال‌سازی:</b> <code>{order.get('resolved_at', '-')}</code>\n",
+        ]
+
+        # Fetch live stats from Conpanel for delivered subs
+        for idx, s in enumerate(delivered_subs, 1):
+            sub_num_str = f" شماره {idx}" if qty > 1 else ""
+            lines.append(f"━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"🔑 <b>مشخصات و مصرف اشتراک{sub_num_str}:</b>")
+
+            email = s.get("email")
+            client_info = conpanel_mgr.get_client(email) if email else None
+            if client_info:
+                up = client_info.get("up", 0)
+                down = client_info.get("down", 0)
+                used_gb = (up + down) / (1024 ** 3)
+                total_bytes = client_info.get("total", 0)
+                total_gb = (total_bytes / (1024 ** 3)) if total_bytes > 0 else float(order.get("volume_gb", 30))
+                rem_gb = max(0.0, total_gb - used_gb)
+                exp_ms = client_info.get("expiryTime", 0)
+                if exp_ms > 0:
+                    days_left = max(0, int((exp_ms - time.time() * 1000) / (86400 * 1000)))
+                    exp_str = f"~{days_left} روز باقیمانده"
+                else:
+                    exp_str = f"{dur_str}"
+
+                lines.append(f"📊 <b>حجم مصرفی:</b> {used_gb:.2f} گیگ از {total_gb:.0f} گیگ")
+                lines.append(f"📈 <b>حجم باقیمانده:</b> {rem_gb:.2f} گیگابایت")
+                lines.append(f"⏳ <b>اعتبار:</b> {exp_str}")
+            else:
+                lines.append(f"📊 <b>حجم کل:</b> {order.get('volume_gb', 30)} گیگابایت | {dur_str}")
+
+            lines.append(f"🔗 <b>لینک ساب اصلی (Primary):</b>\n<code>{html.escape(s.get('sub_url', ''))}</code>")
+            if s.get("bridge_url"):
+                lines.append(f"🌉 <b>لینک ساب کمکی (Bridge Sub):</b>\n<code>{html.escape(s['bridge_url'])}</code>")
+            if s.get("json_url"):
+                lines.append(f"📱 <b>لینک Sing-box / Clash:</b>\n<code>{html.escape(s['json_url'])}</code>")
+
+        lines.append(f"━━━━━━━━━━━━━━━━━━━\n")
+        lines.append(
+            "💡 <i>در صورت بروز هرگونه خطا در آپدیت سابسکریپشن، یکبار شبکه اینترنت خود را تعویض کنید یا از یک VPN کمکی موقت برای Fetch اولیه استفاده فرمایید.</i>"
+        )
+        text = "\n".join(lines)
+
+        markup.add(
+            types.InlineKeyboardButton("📱 دریافت بارکد QR", callback_data=f"order_qr:{order_id}"),
+            types.InlineKeyboardButton("❓ راهنمای رفع مشکل ساب", callback_data=f"order_help:{order_id}"),
+            types.InlineKeyboardButton("🔄 خرید مجدد / تمدید", callback_data=f"plan_sel:{order['plan_id']}"),
+            types.InlineKeyboardButton("🔙 بازگشت به سفارشات من", callback_data="menu:my_orders"),
+        )
+
+    elif st == "AWAITING_PAYMENT":
+        text = (
+            f"⏳ <b>سفارش در انتظار پرداخت <code>{html.escape(order_id)}</code></b>\n\n"
+            f"📦 <b>پلن:</b> {html.escape(str(order.get('plan_name', 'VIP')))}\n"
+            f"🔢 <b>تعداد:</b> {qty} عدد\n"
+            f"💵 <b>مبلغ کل:</b> {order.get('price_toman', 0):,} تومان (~${order.get('price_usd', 0):.1f} USD)\n"
+            f"🌐 <b>شبکه انتقال:</b> {html.escape(str(order.get('crypto_network', '')))}\n\n"
+            f"لطفاً پس از واریز رمزارز، روی دکمه <b>«ثبت رسید / کد رهگیری»</b> کلیک فرمایید تا سفارش شما بررسی و فعال شود."
+        )
+        markup.add(
+            types.InlineKeyboardButton("✅ ثبت رسید / شناسه تراکنش (TxID)", callback_data=f"submit_tx:{order_id}"),
+            types.InlineKeyboardButton("🔙 بازگشت به سفارشات من", callback_data="menu:my_orders"),
+        )
+
+    elif st == "PENDING_VERIFICATION":
+        text = (
+            f"🔍 <b>سفارش در حال بررسی <code>{html.escape(order_id)}</code></b>\n\n"
+            f"📦 <b>پلن:</b> {html.escape(str(order.get('plan_name', 'VIP')))}\n"
+            f"🔢 <b>تعداد:</b> {qty} عدد\n"
+            f"💵 <b>مبلغ:</b> {order.get('price_toman', 0):,} تومان\n"
+            f"📅 <b>تاریخ ارسال رسید:</b> <code>{order.get('submitted_at', order.get('created_at', '-'))}</code>\n\n"
+            f"رسید واریز شما ثبت شده و در انتظار تایید مدیریت است. به محض تایید، کانفیگ شما به صورت خودکار در تلگرام ارسال خواهد شد."
+        )
+        markup.add(
+            types.InlineKeyboardButton("🔙 بازگشت به سفارشات من", callback_data="menu:my_orders"),
+        )
+
+    else:  # REJECTED or other
+        reason = order.get("reject_reason", "عدم تایید رسید توسط مدیریت")
+        text = (
+            f"❌ <b>سفارش رد شده <code>{html.escape(order_id)}</code></b>\n\n"
+            f"📦 <b>پلن:</b> {html.escape(str(order.get('plan_name', 'VIP')))}\n"
+            f"⚠️ <b>علت:</b> {html.escape(str(reason))}\n\n"
+            f"در صورت نیاز به راهنمایی با پشتیبانی در ارتباط باشید."
+        )
+        markup.add(
+            types.InlineKeyboardButton("💎 خرید مجدد پلن VIP", callback_data="menu:buy"),
+            types.InlineKeyboardButton("🔙 بازگشت به سفارشات من", callback_data="menu:my_orders"),
+        )
+
+    try:
+        bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("order_qr:"))
+def handle_order_qr(call):
+    order_id = call.data.split(":", 1)[1]
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    order = order_mgr.get_order(order_id)
+    if not order or order.get("user_id") != user_id:
+        send_message_safe(chat_id, "⛔ سفارش یافت نشد یا دسترسی غیرمجاز است.")
+        return
+
+    sub_url = order.get("delivered_sub_url")
+    if not sub_url:
+        delivered_subs = order.get("delivered_subs") or []
+        if delivered_subs:
+            sub_url = delivered_subs[0].get("sub_url")
+
+    if not sub_url:
+        send_message_safe(chat_id, "⚠️ این سفارش فاقد لینک فعال سابسکریپشن است.")
+        return
+
+    qr_bytes = crypto_manager.generate_qr_bytes(sub_url)
+    caption = (
+        f"📱 <b>بارکد QR سابسکریپشن سفارش <code>{html.escape(order_id)}</code></b>\n\n"
+        f"🔗 <b>لینک سابسکریپشن:</b>\n<code>{html.escape(sub_url)}</code>\n\n"
+        f"💡 در نرم‌افزار <b>v2rayNG</b> یا <b>V2Box</b> گزینه Scan QR Code را بزنید و این تصویر را اسکن فرمایید."
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به جزئیات سفارش", callback_data=f"view_order:{order_id}"))
+    send_photo_safe(chat_id, qr_bytes, caption=caption, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("order_help:"))
+def handle_order_help(call):
+    order_id = call.data.split(":", 1)[1]
+    chat_id = call.message.chat.id
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    text = (
+        "❓ <b>راهنمای جامع رفع اختلال و خطای آپدیت سابسکریپشن:</b>\n\n"
+        "اگر در برنامه‌های <b>v2rayNG</b> / <b>V2Box</b> / <b>Streisand</b> / <b>Sing-box</b> هنگام Update سابسکریپشن با خطا مواجه شدید یا سرورها لود نشدند، راهکارهای زیر را امتحان کنید:\n\n"
+        "۱️⃣ <b>تغییر اپراتور اینترنت (MCI / Irancell / Wi-Fi):</b>\n"
+        "در بسیاری از مواقع فیلترینگ روی یک اپراتور شدیدتر است. کافیست اینترنت خود را مثلاً از همراه اول به ایرانسل یا اینترنت خانگی (وای‌فای شاتل/مخابرات) تغییر داده و دکمه Update ساب را بزنید.\n\n"
+        "۲️⃣ <b>استفاده از VPN کمکی موقت (Initial Fetch):</b>\n"
+        "برای بارگیری اولیه، یک فیلترشکن کمکی یا یکی از کانفیگ‌های رایگان ربات را برای چند ثانیه متصل کنید تا نرم‌افزار بتواند لینک ساب را یک‌بار دریافت کند. پس از ظاهر شدن سرورهای VIP، فیلترشکن کمکی را قطع کرده و به سرورهای VIP اختصاصی خود وصل شوید.\n\n"
+        "۳️⃣ <b>استفاده از لینک ساب پشتیبان (Bridge Sub):</b>\n"
+        "در بخش جزئیات سفارش، یک لینک کمکی «Bridge» نیز قرار داده شده است. در صورتی که دامنه اصلی در اپراتور شما با اختلال مواجه بود، لینک ساب Bridge را در نرم‌افزار خود اضافه نمایید.\n\n"
+        "۴️⃣ <b>فعال‌سازی قابلیت Fragment:</b>\n"
+        "در برنامه v2rayNG وارد Settings شده و گزینه <b>Fragment</b> را روشن کنید. این قابلیت بسته‌های رمزنگاری‌شده TLS را تکه‌تکه می‌کند تا سیستم فیلترینگ نتواند ترافیک را شناسایی و مسدود کند."
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به جزئیات سفارش", callback_data=f"view_order:{order_id}"))
+
+    try:
+        bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.message_handler(commands=['orders', 'myorders'])
+def cmd_my_orders(message):
+    show_my_orders_menu(message.chat.id, message.from_user.id)
 
 
 @bot.message_handler(commands=['start', 'help'])
@@ -2367,7 +2587,11 @@ def handle_buy_vol_callback(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("plan_sel:"))
 def handle_plan_selection(call):
-    plan_id = call.data.split(":", 1)[1]
+    parts = call.data.split(":")
+    plan_id = parts[1]
+    qty = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+    qty = max(1, min(qty, 10))
+
     plans = {p["id"]: p for p in get_vip_plans()}
     plan = plans.get(plan_id)
     try:
@@ -2379,30 +2603,41 @@ def handle_plan_selection(call):
         send_message_safe(call.message.chat.id, "⚠️ پلن مورد نظر یافت نشد.")
         return
 
-    calc = crypto_manager.calculate_adaptive_prices(plan["price_usd"])
+    unit_usd = plan["price_usd"]
+    unit_toman = plan.get("price_toman", 0)
+    total_usd = round(unit_usd * qty, 2)
+    total_toman = unit_toman * qty
+    calc = crypto_manager.calculate_adaptive_prices(total_usd)
+
     devices = plan.get("devices", 1)
     volume_gb = plan.get("volume_gb", 30)
     dur_days = plan.get("duration_days", 30)
     dur_map = {30: "۱ ماهه", 90: "۳ ماهه", 180: "۶ ماهه"}
     dur_str = dur_map.get(dur_days, f"{dur_days} روز")
-    toman_price = plan.get("price_toman", 0)
 
+    qty_note = f" (هر اشتراک: {unit_toman:,} تومان)" if qty > 1 else ""
     text = (
-        f"💎 <b>جزئیات و انتخاب روش پرداخت:</b>\n\n"
-        f"▫️ <b>تعداد کاربر همزمان:</b> {devices} کاربره\n"
-        f"▫️ <b>حجم ترافیک:</b> {volume_gb} گیگابایت\n"
-        f"▫️ <b>مدت اعتبار:</b> {dur_str} ({dur_days} روز)\n"
-        f"▫️ <b>مبلغ تومانی:</b> {toman_price:,} تومان\n\n"
+        f"💎 <b>جزئیات پلن و انتخاب تعداد / روش پرداخت:</b>\n\n"
+        f"▫️ <b>پلن انتخابی:</b> {volume_gb} گیگابایت | {dur_str} ({devices} کاربره)\n"
+        f"▫️ <b>تعداد اشتراک انتخابی:</b> <b>{qty} عدد</b>\n"
+        f"▫️ <b>مجموع مبلغ تومانی:</b> <b>{total_toman:,} تومان</b>{qty_note}\n\n"
         f"💰 <b>مبلغ قابل پرداخت با رمزارز (نرخ لحظه‌ای بازار):</b>\n"
         f"💵 <b>معادل تتر (USDT):</b> ${calc['usdt']:.2f} USDT\n"
         f"🔺 <b>معادل ترون (TRX):</b> ~{calc['trx']} TRX\n"
         f"🔹 <b>معادل اتریوم (ETH):</b> ~{calc['eth']} ETH\n\n"
-        f"👇 <i>لطفاً شبکه انتقال رمزارز مورد نظر خود را انتخاب نمایید:</i>"
+        f"👇 <i>می‌توانید تعداد اشتراک را تغییر دهید یا شبکه پرداخت را انتخاب فرمایید:</i>"
     )
-    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    markup = types.InlineKeyboardMarkup(row_width=4)
+    qty_buttons = []
+    for q in [1, 2, 3, 5]:
+        label = f"{q} عدد {'✅' if q == qty else ''}".strip()
+        qty_buttons.append(types.InlineKeyboardButton(label, callback_data=f"plan_sel:{plan_id}:{q}"))
+    markup.row(*qty_buttons)
+
     markup.add(
-        types.InlineKeyboardButton("🔺 پرداخت در شبکه ترون (TRX / USDT-TRC20)", callback_data=f"pay_net:{plan_id}:tron"),
-        types.InlineKeyboardButton("🔹 پرداخت در شبکه اتریوم (ETH / USDT-ERC20)", callback_data=f"pay_net:{plan_id}:eth"),
+        types.InlineKeyboardButton("🔺 پرداخت در شبکه ترون (TRX / USDT-TRC20)", callback_data=f"pay_net:{plan_id}:tron:{qty}"),
+        types.InlineKeyboardButton("🔹 پرداخت در شبکه اتریوم (ETH / USDT-ERC20)", callback_data=f"pay_net:{plan_id}:eth:{qty}"),
         types.InlineKeyboardButton("🔙 بازگشت به انتخاب مدت زمان", callback_data=f"buy_vol:{devices}:{volume_gb}")
     )
     try:
@@ -2413,7 +2648,12 @@ def handle_plan_selection(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_net:"))
 def handle_payment_network(call):
-    _, plan_id, network = call.data.split(":", 2)
+    parts = call.data.split(":")
+    plan_id = parts[1]
+    network = parts[2]
+    qty = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
+    qty = max(1, min(qty, 10))
+
     plans = {p["id"]: p for p in get_vip_plans()}
     plan = plans.get(plan_id)
     try:
@@ -2425,7 +2665,11 @@ def handle_payment_network(call):
         send_message_safe(call.message.chat.id, "⚠️ پلن مورد نظر یافت نشد.")
         return
 
-    calc = crypto_manager.calculate_adaptive_prices(plan["price_usd"])
+    unit_usd = plan["price_usd"]
+    unit_toman = plan.get("price_toman", 0)
+    total_usd = round(unit_usd * qty, 2)
+    total_toman = unit_toman * qty
+    calc = crypto_manager.calculate_adaptive_prices(total_usd)
 
     if network == "tron":
         wallet_address = crypto_manager.TRON_WALLET
@@ -2440,7 +2684,7 @@ def handle_payment_network(call):
         amount_str = f"<b>{calc['eth']} ETH</b> یا <b>${calc['usdt']:.2f} USDT-ERC20</b>"
         crypto_amount = calc['eth']
 
-    # Create order in order_manager
+    # Create order in order_manager with quantity
     order_id = order_mgr.create_order(
         user_id=call.from_user.id,
         username=call.from_user.username,
@@ -2449,18 +2693,20 @@ def handle_payment_network(call):
         crypto_network=net_title,
         crypto_currency=crypto_curr,
         crypto_amount=crypto_amount,
+        quantity=qty,
     )
 
-    toman_price = plan.get("price_toman", 0)
     dur_days = plan.get("duration_days", 30)
     dur_map = {30: "۱ ماهه", 90: "۳ ماهه", 180: "۶ ماهه"}
     dur_str = dur_map.get(dur_days, f"{dur_days} روز")
 
+    qty_line = f"🔢 <b>تعداد اشتراک:</b> {qty} عدد\n" if qty > 1 else ""
     qr_bytes = crypto_manager.generate_qr_bytes(wallet_address)
     caption = (
         f"🧾 <b>فاکتور پرداخت سفارش <code>{order_id}</code></b>\n\n"
         f"📦 <b>پلن:</b> {plan.get('volume_gb', 30)} گیگ | {dur_str} ({plan.get('devices', 1)} کاربره)\n"
-        f"💵 <b>مبلغ سفارش:</b> {toman_price:,} تومان (~${plan['price_usd']:.0f} USD)\n"
+        f"{qty_line}"
+        f"💵 <b>مبلغ کل سفارش:</b> {total_toman:,} تومان (~${total_usd:.1f} USD)\n"
         f"🌐 <b>شبکه انتقال:</b> {net_title}\n"
         f"💰 <b>مبلغ قابل واریز:</b> {amount_str}\n\n"
         f"📍 <b>آدرس کیف پول جهت واریز:</b>\n"
@@ -2469,12 +2715,12 @@ def handle_payment_network(call):
         f"⚠️ <b>راهنمای تکمیل خرید:</b>\n"
         f"۱. مبلغ مشخص‌شده را به آدرس بالا انتقال دهید.\n"
         f"۲. پس از انجام انتقال، دکمه <b>«ثبت رسید / شناسه تراکنش (TxID)»</b> را بزنید و کد هش (TxID) یا عکس رسید را ارسال نمایید.\n"
-        f"۳. پس از تایید مدیریت، کانفیگ اختصاصی شما به صورت خودکار صادر خواهد شد."
+        f"۳. پس از تایید مدیریت، اشتراک اختصاصی شما به صورت خودکار صادر خواهد شد."
     )
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("✅ ثبت رسید / شناسه تراکنش (TxID)", callback_data=f"submit_tx:{order_id}"),
-        types.InlineKeyboardButton("🔙 بازگشت به جزئیات پلن", callback_data=f"plan_sel:{plan_id}")
+        types.InlineKeyboardButton("🔙 بازگشت به جزئیات پلن", callback_data=f"plan_sel:{plan_id}:{qty}")
     )
     send_photo_safe(call.message.chat.id, qr_bytes, caption=caption, parse_mode="HTML", reply_markup=markup)
 
@@ -2583,23 +2829,32 @@ def handle_admin_decision(call):
             pass
         return
 
+    qty = order.get("quantity", 1)
     try:
-        bot.answer_callback_query(call.id, f"در حال ایجاد کانفیگ برای {order_id}...")
+        bot.answer_callback_query(call.id, f"در حال ایجاد {qty} اشتراک برای {order_id}...")
     except Exception:
         pass
 
-    email_tag = f"tg_{order['user_id']}"
-    creation_res = conpanel_mgr.create_customer_subscription(
-        email=email_tag,
-        total_gb=order["volume_gb"],
-        expiry_days=order["duration_days"],
-        limit_hwid=order.get("devices", 1),
-        tg_id=order["user_id"]
-    )
+    delivered_subs = []
+    errors = []
+    for i in range(qty):
+        tag_suffix = f"_{i+1}_{secrets.token_hex(2)}" if qty > 1 else ""
+        email_tag = f"tg_{order['user_id']}{tag_suffix}"
+        creation_res = conpanel_mgr.create_customer_subscription(
+            email=email_tag,
+            total_gb=order["volume_gb"],
+            expiry_days=order["duration_days"],
+            limit_hwid=order.get("devices", 1),
+            tg_id=order["user_id"]
+        )
+        if creation_res.get("success"):
+            delivered_subs.append(creation_res)
+        else:
+            errors.append(creation_res.get("error", "Unknown error"))
 
-    if not creation_res.get("success"):
+    if not delivered_subs:
         order_mgr.cancel_approving_order(order_id)
-        err_msg = creation_res.get("error", "Unknown panel error")
+        err_msg = "; ".join(errors) or "Unknown panel error"
         logger.error("Failed to auto-create client for %s: %s", order_id, err_msg)
         # Re-attach markup so admin can retry after fixing panel
         markup = types.InlineKeyboardMarkup(row_width=2)
@@ -2610,34 +2865,61 @@ def handle_admin_decision(call):
         send_message_safe(call.message.chat.id, f"❌ خطا در ساخت کانفیگ روی سرور برای سفارش <code>{html.escape(order_id)}</code>:\n{html.escape(str(err_msg))}", reply_markup=markup, parse_mode="HTML")
         return
 
-    sub_url = creation_res["sub_url"]
-    json_url = creation_res["json_url"]
-    order_mgr.approve_order(order_id, sub_url)
+    primary_sub = delivered_subs[0]["sub_url"]
+    order_mgr.approve_order(order_id, primary_sub, delivered_subs=delivered_subs)
 
     # Deliver to customer
     try:
-        qr_bytes = crypto_manager.generate_qr_bytes(sub_url)
-        cust_msg = (
-            f"🎉 <b>سفارش شما با موفقیت تایید و فعال شد!</b>\n\n"
-            f"🆔 <b>کد پیگیری:</b> <code>{html.escape(order_id)}</code>\n"
-            f"📦 <b>پلن:</b> {html.escape(str(order['plan_name']))}\n"
-            f"📊 <b>حجم ترافیک:</b> {order['volume_gb']} گیگابایت\n"
-            f"⏳ <b>مدت اعتبار:</b> {order['duration_days']} روز\n"
-            f"👥 <b>تعداد کاربر مجاز:</b> {order.get('devices', 1)} دستگاه\n\n"
-            f"🔗 <b>لینک سابسکریپشن اختصاصی شما (برای کپی لمس کنید):</b>\n"
-            f"<code>{html.escape(sub_url)}</code>\n\n"
-            f"📱 <b>لینک سابسکریپشن مخصوص Sing-box / Clash:</b>\n"
-            f"<code>{html.escape(json_url)}</code>\n\n"
-            f"💡 <b>راهنمای اتصال:</b>\n"
-            f"۱. لینک فوق را کپی کنید یا بارکد QR زیر را در برنامه اسکن فرمایید.\n"
-            f"۲. در برنامه <b>v2rayNG</b> یا <b>V2Box</b> یا <b>Streisand</b> به بخش Subscription رفته و Update را بزنید.\n"
-            f"۳. <b>نکته مهم برای همراه اول و ایرانسل:</b> در صورت اختلال، در تنظیمات برنامه گزینه <b>Fragment</b> را فعال نمایید.\n\n"
-            f"از اعتماد شما به LitixConnect سپاسگزاریم! ❤️"
+        qr_bytes = crypto_manager.generate_qr_bytes(primary_sub)
+        qty_title = f"\n🔢 <b>تعداد اشتراک:</b> {qty} عدد" if qty > 1 else ""
+        lines = [
+            f"🎉 <b>سفارش شما با موفقیت تایید و فعال شد!</b>\n",
+            f"🆔 <b>کد پیگیری:</b> <code>{html.escape(order_id)}</code>",
+            f"📦 <b>پلن:</b> {html.escape(str(order['plan_name']))}{qty_title}",
+            f"📊 <b>حجم ترافیک هر اشتراک:</b> {order['volume_gb']} گیگابایت",
+            f"⏳ <b>مدت اعتبار:</b> {order['duration_days']} روز",
+            f"👥 <b>تعداد کاربر مجاز:</b> {order.get('devices', 1)} دستگاه\n",
+        ]
+
+        for idx, sub in enumerate(delivered_subs, 1):
+            num_str = f" شماره {idx}" if qty > 1 else ""
+            lines.append("━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"🔑 <b>اشتراک{num_str}:</b>")
+            lines.append(f"🔗 <b>لینک ساب اصلی:</b>\n<code>{html.escape(sub['sub_url'])}</code>")
+            if sub.get("bridge_url"):
+                lines.append(f"🌉 <b>لینک ساب کمکی (Bridge Sub):</b>\n<code>{html.escape(sub['bridge_url'])}</code>")
+            if sub.get("json_url"):
+                lines.append(f"📱 <b>لینک مخصوص Sing-box:</b>\n<code>{html.escape(sub['json_url'])}</code>")
+
+        lines.append("━━━━━━━━━━━━━━━━━━━\n")
+        lines.append(
+            "💡 <b>راهنمای اتصال و رفع اختلال در صورت عدم بارگیری:</b>\n"
+            "۱. <b>تغییر اپراتور اینترنت:</b> در صورت خطا در Update سابسکریپشن، یک‌بار اینترنت خود را تعویض کنید (سوییچ بین همراه اول، ایرانسل یا وای‌فای خانگی).\n"
+            "۲. <b>استفاده از VPN کمکی موقت:</b> می‌توانید یک فیلترشکن کمکی یا کانفیگ رایگان روشن کنید تا برنامه یک‌بار ساب را بارگیری کند، سپس VPN کمکی را قطع کرده و به سرورهای VIP متصل شوید.\n"
+            "۳. <b>ساب پشتیبان (Bridge):</b> در صورت اختلال در لینک اول، از لینک Bridge بالا استفاده نمایید.\n"
+            "۴. <b>گزینه Fragment:</b> در صورت کندی روی همراه اول/ایرانسل، گزینه Fragment را در تنظیمات v2rayNG روشن فرمایید.\n\n"
+            "از اعتماد شما به LitixConnect سپاسگزاریم! ❤️"
         )
-        send_photo_safe(order["user_id"], qr_bytes, caption=cust_msg, parse_mode="HTML")
+        cust_msg = "\n".join(lines)
+
+        cust_markup = types.InlineKeyboardMarkup(row_width=2)
+        cust_markup.add(
+            types.InlineKeyboardButton("👤 مشاهده در سفارشات من", callback_data=f"view_order:{order_id}"),
+            types.InlineKeyboardButton("📱 بارکد QR", callback_data=f"order_qr:{order_id}"),
+        )
+        cust_markup.add(
+            types.InlineKeyboardButton("❓ راهنمای رفع مشکل ساب", callback_data=f"order_help:{order_id}"),
+            types.InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu:main"),
+        )
+
+        if len(cust_msg) <= 1000:
+            send_photo_safe(order["user_id"], qr_bytes, caption=cust_msg, parse_mode="HTML", reply_markup=cust_markup)
+        else:
+            send_photo_safe(order["user_id"], qr_bytes, caption=f"🎉 سفارش <code>{html.escape(order_id)}</code> با موفقیت فعال شد!", parse_mode="HTML")
+            send_message_safe(order["user_id"], cust_msg, parse_mode="HTML", reply_markup=cust_markup)
     except Exception as e:
         logger.error("Failed to deliver subscription to user %s: %s", order["user_id"], e)
-        send_message_safe(order["user_id"], f"✅ کانفیگ شما ساخته شد:\n<code>{html.escape(sub_url)}</code>", parse_mode="HTML")
+        send_message_safe(order["user_id"], f"✅ کانفیگ شما ساخته شد:\n<code>{html.escape(primary_sub)}</code>", parse_mode="HTML")
 
     send_message_safe(call.message.chat.id, f"✅ سفارش <code>{html.escape(order_id)}</code> با موفقیت تایید شد و لینک برای کاربر ارسال گردید.", parse_mode="HTML")
 

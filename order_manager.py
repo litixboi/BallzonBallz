@@ -53,6 +53,7 @@ class OrderManager:
         crypto_network: str,
         crypto_currency: str,
         crypto_amount: float,
+        quantity: int = 1,
     ) -> str:
         """Create a new pending order and return its order_id."""
         with _lock:
@@ -62,6 +63,12 @@ class OrderManager:
                 if oid not in self._orders:
                     break
 
+            qty = max(1, int(quantity))
+            unit_usd = float(plan.get("price_usd", 0.0))
+            unit_toman = int(plan.get("price_toman", 0))
+            total_usd = round(unit_usd * qty, 2)
+            total_toman = unit_toman * qty
+
             order = {
                 "order_id": oid,
                 "user_id": user_id,
@@ -69,11 +76,14 @@ class OrderManager:
                 "first_name": first_name or "",
                 "plan_id": plan["id"],
                 "plan_name": plan.get("name_fa", plan.get("name_en", "VIP Plan")),
+                "quantity": qty,
                 "volume_gb": plan.get("volume_gb", 30),
                 "duration_days": plan.get("duration_days", 30),
                 "devices": plan.get("devices", 1),
-                "price_usd": plan.get("price_usd", 0.0),
-                "price_toman": plan.get("price_toman", 0),
+                "price_usd": total_usd,
+                "unit_price_usd": unit_usd,
+                "price_toman": total_toman,
+                "unit_price_toman": unit_toman,
                 "crypto_network": crypto_network,
                 "crypto_currency": crypto_currency,
                 "crypto_amount": crypto_amount,
@@ -83,6 +93,7 @@ class OrderManager:
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "resolved_at": None,
                 "delivered_sub_url": None,
+                "delivered_subs": [],
             }
             self._orders[oid] = order
             self._save()
@@ -158,7 +169,7 @@ class OrderManager:
                 return True
             return False
 
-    def approve_order(self, order_id: str, sub_url: str) -> bool:
+    def approve_order(self, order_id: str, sub_url: str, delivered_subs: Optional[List[Dict[str, Any]]] = None) -> bool:
         with _lock:
             if order_id not in self._orders:
                 return False
@@ -166,6 +177,10 @@ class OrderManager:
             order.pop("_approving", None)
             order["status"] = "APPROVED"
             order["delivered_sub_url"] = sub_url
+            if delivered_subs:
+                order["delivered_subs"] = delivered_subs
+            elif not order.get("delivered_subs"):
+                order["delivered_subs"] = [{"sub_url": sub_url}]
             order["resolved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._save()
             return True

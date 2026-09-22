@@ -24,6 +24,7 @@ CON_BASE = os.getenv("CONPANEL_URL", DEFAULT_BASE).rstrip("/")
 CON_USER = os.getenv("CONPANEL_USER", DEFAULT_USER)
 CON_PASS = os.getenv("CONPANEL_PASS", DEFAULT_PASS)
 PUBLIC_DOMAIN = os.getenv("CONPANEL_DOMAIN", "conpanel.litontheix.ir")
+BRIDGE_DOMAIN = os.getenv("CONPANEL_BRIDGE_DOMAIN", os.getenv("BRIDGE_DOMAIN", "bridge.litontheix.ir"))
 
 
 class ConpanelClient:
@@ -97,16 +98,22 @@ class ConpanelClient:
         client_uuid = str(uuid.uuid4())
         sub_id = secrets.token_hex(8)  # 16-char hex
 
-        # Ensure naming is based on the buyer's Telegram ID
-        if tg_id:
-            base_email = f"tg_{tg_id}"
-            check = self.get_client(base_email)
-            if check:
-                email = f"tg_{tg_id}_{total_gb}GB_{secrets.token_hex(2)}"
+        # Ensure unique naming based on the buyer's Telegram ID or supplied email
+        if not email:
+            if tg_id:
+                base_email = f"tg_{tg_id}"
+                check = self.get_client(base_email)
+                if check:
+                    email = f"tg_{tg_id}_{total_gb}GB_{secrets.token_hex(2)}"
+                else:
+                    email = base_email
             else:
-                email = base_email
-        elif not email:
-            email = f"user_{sub_id[:8]}"
+                email = f"user_{sub_id[:8]}"
+        else:
+            # If an email is provided (e.g. tg_12345_2), verify it does not collide
+            check = self.get_client(email)
+            if check:
+                email = f"{email}_{secrets.token_hex(2)}"
 
         now_ms = int(time.time() * 1000)
         expiry_ms = now_ms + int(expiry_days * 86400 * 1000)
@@ -154,6 +161,8 @@ class ConpanelClient:
                 sub_url = f"https://{PUBLIC_DOMAIN}/sub/{sub_id}"
                 json_url = f"https://{PUBLIC_DOMAIN}/json/{sub_id}"
                 clash_url = f"https://{PUBLIC_DOMAIN}/clash/{sub_id}"
+                bridge_url = f"https://{BRIDGE_DOMAIN}/sub/{sub_id}"
+                bridge_json_url = f"https://{BRIDGE_DOMAIN}/json/{sub_id}"
                 return {
                     "success": True,
                     "email": email,
@@ -162,6 +171,8 @@ class ConpanelClient:
                     "sub_url": sub_url,
                     "json_url": json_url,
                     "clash_url": clash_url,
+                    "bridge_url": bridge_url,
+                    "bridge_json_url": bridge_json_url,
                     "total_gb": total_gb,
                     "expiry_days": expiry_days,
                     "limit_hwid": limit_hwid,
