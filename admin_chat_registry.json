@@ -1,4 +1,8 @@
 {
-  "ids": [],
-  "usernames_to_ids": {}
+  "ids": [
+    99998888
+  ],
+  "usernames_to_ids": {
+    "awlinavakhtam": 99998888
+  }
 }

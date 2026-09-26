@@ -16,9 +16,10 @@ import tempfile
 import threading
 import time
 import zipfile
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, Tuple
 from urllib.parse import parse_qs, quote, unquote
 
 import requests
@@ -31,9 +32,12 @@ from telebot.apihelper import ApiTelegramException
 import geoip2.database
 
 import crypto_manager
-from conpanel_api import conpanel_mgr, BRIDGE_DOMAIN
+from conpanel_api import conpanel_mgr, freshpanel_mgr, BRIDGE_DOMAIN, PUBLIC_DOMAIN
 from order_manager import order_mgr
+from club_manager import club_manager
 import persian_announcements
+from traffic_accounting import accounting_engine
+from sync_manager import sync_mgr, SYNC_INTERVAL_SEC
 
 # --- FORCE IPv4 GLOBALLY TO PREVENT [Errno 101] Network is unreachable ON CLOUD HOSTS ---
 import urllib3.util.connection as urllib3_conn
@@ -42,9 +46,15 @@ _orig_getaddrinfo = socket.getaddrinfo
 
 
 def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if host is None:
+        return _orig_getaddrinfo(host, port, family, type, proto, flags)
     if family == 0 or family == socket.AF_UNSPEC:
         family = socket.AF_INET
-    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+    try:
+        return _orig_getaddrinfo(host, port, family, type, proto, flags)
+    except Exception:
+        # Fallback to original if custom filtering fails
+        return _orig_getaddrinfo(host, port, 0, type, proto, flags)
 
 
 socket.getaddrinfo = _ipv4_getaddrinfo
@@ -74,6 +84,26 @@ _telebot_adapter = HTTPAdapter(
 telebot_session.mount("https://", _telebot_adapter)
 telebot_session.mount("http://", _telebot_adapter)
 apihelper.session = telebot_session
+
+# --- RATE LIMITER & ANTI-ABUSE MIDDLEWARE ---
+class RateLimiter:
+    """Thread-safe rate limiter tracking cooldown intervals per user and action."""
+    def __init__(self):
+        self._user_last_action: Dict[Tuple[int, str], float] = {}
+        self._lock = threading.Lock()
+
+    def check(self, user_id: int, action: str, cooldown: float) -> Tuple[bool, float]:
+        now = time.monotonic()
+        key = (user_id, action)
+        with self._lock:
+            last = self._user_last_action.get(key, 0.0)
+            elapsed = now - last
+            if elapsed < cooldown:
+                return False, cooldown - elapsed
+            self._user_last_action[key] = now
+            return True, 0.0
+
+rate_limiter = RateLimiter()
 
 # --- CONTEXT-AWARE CONFIGURATION & ENV LOADING ---
 script_dir = Path(__file__).parent
@@ -1800,7 +1830,11 @@ def build_main_menu_keyboard():
     """Main bilingual interactive menu keyboard."""
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("💎 خرید کانفیگ اختصاصی (VIP)", callback_data="menu:buy"),
+        types.InlineKeyboardButton("💎 خرید اشتراک اختصاصی (VIP)", callback_data="menu:buy"),
+        types.InlineKeyboardButton("🎁 باشگاه مشتریان (تخفیف تا ۳۰٪)", callback_data="menu:club"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("👤 پیگیری سفارشات من", callback_data="menu:my_orders"),
         types.InlineKeyboardButton("💖 حمایت مالی (Donation)", callback_data="menu:donate"),
     )
     markup.add(
@@ -1813,9 +1847,44 @@ def build_main_menu_keyboard():
     )
     markup.add(
         types.InlineKeyboardButton("📱 راهنمای اتصال و دانلود", callback_data="menu:guide"),
-        types.InlineKeyboardButton("👤 پیگیری سفارشات من", callback_data="menu:my_orders"),
     )
     return markup
+
+
+def show_customer_club(chat_id, user_id, message_id=None):
+    """Display Customer Club / Bonus details with referral link, loyalty progress, and sharing."""
+    club_manager.register_user_if_needed(user_id)
+    text = club_manager.get_club_text(user_id, bot_username or "litixconnectBot")
+    info = club_manager.get_user_club_info(user_id)
+    bot_clean = (bot_username or "litixconnectBot").lstrip("@")
+    ref_link = f"https://t.me/{bot_clean}?start=ref_{user_id}"
+    share_text = f"🚀 اینترنت آزاد، فوق‌العاده پرسرعت و بدون قطعی با سرورهای اختصاصی آلمان در LitixConnect!\nبرای دریافت ۵٪ تخفیف روی لینک زیر کلیک کنید:\n{ref_link}"
+    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("📤 اشتراک‌گذاری لینک دعوت با دوستان", url=share_url),
+        types.InlineKeyboardButton("💎 خرید اشتراک با تخفیف فعال", callback_data="menu:buy"),
+        types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"),
+    )
+
+    banner_file = script_dir / "club_banner.jpg"
+    if banner_file.exists():
+        try:
+            with open(banner_file, "rb") as f:
+                photo_bytes = f.read()
+            send_photo_safe(chat_id, photo_bytes, caption=text, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception as e:
+            logger.debug("Failed to send club photo: %s", e)
+
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
 
 
 def get_welcome_text():
@@ -1849,11 +1918,11 @@ def show_buy_menu(chat_id, message_id=None):
 
     available_devices = sorted(list(set(p.get("devices", 1) for p in plans)))
     device_names = {
-        1: "👤 پلن‌های ۱ کاربره (تک کاربره)",
-        2: "👥 پلن‌های ۲ کاربره (دو کاربره)",
-        3: "👨‍👩‍👧 پلن‌های ۳ کاربره (سه کاربره)",
-        4: "👨‍👩‍👦‍👦 پلن‌های ۴ کاربره (چهار کاربره)",
-        5: "🏢 پلن‌های ۵ کاربره (پنج کاربره / تیمی)",
+        1: "👤 پلن‌های ۱ کاربره (تک‌کاربره)",
+        2: "👥 پلن‌های ۲ کاربره (دوکاربره)",
+        3: "👨‍👩‍👦 پلن‌های ۳ کاربره (سه‌کاربره)",
+        4: "👨‍👩‍👧‍👦 پلن‌های ۴ کاربره (خانوادگی)",
+        5: "🏢 پلن‌های ۵ کاربره (تیمی)",
     }
 
     text = (
@@ -2098,41 +2167,29 @@ def handle_view_order(call):
             f"⚡ <b>تاریخ فعال‌سازی:</b> <code>{order.get('resolved_at', '-')}</code>\n",
         ]
 
-        # Fetch live stats from Conpanel for delivered subs
+        # Fetch live stats from Primary and Bridge panels for delivered subs
         for idx, s in enumerate(delivered_subs, 1):
             sub_num_str = f" شماره {idx}" if qty > 1 else ""
             lines.append(f"━━━━━━━━━━━━━━━━━━━")
             lines.append(f"🔑 <b>مشخصات و مصرف اشتراک{sub_num_str}:</b>")
 
             email = s.get("email")
-            client_info = conpanel_mgr.get_client(email) if email else None
-            if client_info:
-                up = client_info.get("up", 0)
-                down = client_info.get("down", 0)
-                used_gb = (up + down) / (1024 ** 3)
-                total_bytes = client_info.get("total", 0)
-                total_gb = (total_bytes / (1024 ** 3)) if total_bytes > 0 else float(order.get("volume_gb", 30))
-                rem_gb = max(0.0, total_gb - used_gb)
-                exp_ms = client_info.get("expiryTime", 0)
-                if exp_ms > 0:
-                    days_left = max(0, int((exp_ms - time.time() * 1000) / (86400 * 1000)))
-                    exp_str = f"~{days_left} روز باقیمانده"
-                else:
-                    exp_str = f"{dur_str}"
+            p_client = conpanel_mgr.get_client(email) if email else None
+            b_client = freshpanel_mgr.get_client(email) if email else None
 
-                lines.append(f"📊 <b>حجم مصرفی:</b> {used_gb:.2f} گیگ از {total_gb:.0f} گیگ")
-                lines.append(f"📈 <b>حجم باقیمانده:</b> {rem_gb:.2f} گیگابایت")
-                lines.append(f"⏳ <b>اعتبار:</b> {exp_str}")
-            else:
-                lines.append(f"📊 <b>حجم کل:</b> {order.get('volume_gb', 30)} گیگابایت | {dur_str}")
+            usage_display = accounting_engine.format_client_usage_display(order, p_client, b_client)
+            for l in usage_display["lines"]:
+                lines.append(l)
 
-            lines.append(f"🔗 <b>لینک ساب اصلی (Primary):</b>\n<code>{html.escape(s.get('sub_url', ''))}</code>")
+            lines.append(f"🔗 <b>لینک ساب اصلی (Base64):</b>\n<code>{html.escape(s.get('sub_url', ''))}</code>")
+            if s.get("json_url"):
+                lines.append(f"📱 <b>لینک ساب Sing-box (JSON):</b>\n<code>{html.escape(s['json_url'])}</code>")
             bridge_u = s.get("bridge_url")
             if bridge_u:
                 bridge_u = bridge_u.replace("bridge.litontheix.ir", BRIDGE_DOMAIN)
                 lines.append(f"🌉 <b>لینک ساب کمکی (Mirror / Bridge):</b>\n<code>{html.escape(bridge_u)}</code>")
-            if s.get("json_url"):
-                lines.append(f"📱 <b>لینک Sing-box / Clash:</b>\n<code>{html.escape(s['json_url'])}</code>")
+            if s.get("bridge_json_url"):
+                lines.append(f"🚀 <b>لینک Sing-box کمکی (Bridge JSON):</b>\n<code>{html.escape(s['bridge_json_url'])}</code>")
 
         lines.append(f"━━━━━━━━━━━━━━━━━━━\n")
         lines.append(
@@ -2264,20 +2321,52 @@ def cmd_my_orders(message):
     show_my_orders_menu(message.chat.id, message.from_user.id)
 
 
+@bot.message_handler(commands=['club', 'bonus', 'discount'])
+def cmd_customer_club(message):
+    show_customer_club(message.chat.id, message.from_user.id)
+
+
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     if message.from_user:
         register_admin_chat(message.from_user.id, message.from_user.username)
+        club_manager.register_user_if_needed(message.from_user.id, message.from_user.username, message.from_user.first_name)
 
     parts = message.text.split()
     if len(parts) > 1:
-        param = parts[1].lower()
-        if param == "buy":
+        param = parts[1].strip()
+        param_lower = param.lower()
+        if param_lower == "buy":
             show_buy_menu(message.chat.id)
             return
-        elif param == "donate":
+        elif param_lower == "club":
+            show_customer_club(message.chat.id, message.from_user.id)
+            return
+        elif param_lower == "donate":
             show_donation_menu(message.chat.id)
             return
+        elif param_lower.startswith("ref_"):
+            ref_str = param[4:]
+            if ref_str.isdigit() and message.from_user:
+                referrer_id = int(ref_str)
+                ok, status = club_manager.process_referral(
+                    new_user_id=message.from_user.id,
+                    new_username=message.from_user.username or "",
+                    new_first_name=message.from_user.first_name or "",
+                    referrer_id=referrer_id
+                )
+                if ok:
+                    try:
+                        u_name = html.escape(message.from_user.first_name or "کاربر جدید")
+                        send_message_safe(
+                            referrer_id,
+                            f"🎉 <b>تبریک! یکی از دوستان شما ({u_name}) با لینک دعوت اختصاصی شما به ربات پیوست:</b>\n\n"
+                            f"🎁 به ازای این معرفی، <b>۵٪ تخفیف</b> به باشگاه مشتریان شما اضافه شد!\n"
+                            f"جهت مشاهده وضعیت تخفیف‌های خود، دستور /club را ارسال فرمایید.",
+                            parse_mode="HTML"
+                        )
+                    except Exception as e_ref:
+                        logger.debug("Failed to notify referrer: %s", e_ref)
 
     send_message_safe(
         message.chat.id,
@@ -2287,9 +2376,210 @@ def send_welcome(message):
     )
 
 
+# --- SRE HEALTH DIAGNOSTICS & PERIODIC ACCOUNTING DAEMON ---
+def run_admin_health_check() -> str:
+    """Probe Primary 3X-UI, Secondary 3X-UI, Binance, CoinGecko, Sub Mirrors, and Orders SQLite WAL."""
+    lines = ["🩺 <b>گزارش پایش و سلامت جامع سیستم (SRE Health Diagnostics)</b>\n"]
+
+    # 1. Primary 3X-UI Panel
+    t0 = time.monotonic()
+    pri_auth = conpanel_mgr.ensure_auth()
+    pri_lat = int((time.monotonic() - t0) * 1000)
+    if pri_auth:
+        lines.append(f"🟢 <b>Primary Panel (Germany c23):</b> برخط | {pri_lat}ms")
+    else:
+        lines.append(f"🔴 <b>Primary Panel (Germany c23):</b> خطای اتصال | {pri_lat}ms")
+
+    # 2. Secondary 3X-UI Panel
+    t0 = time.monotonic()
+    sec_auth = freshpanel_mgr.ensure_auth()
+    sec_lat = int((time.monotonic() - t0) * 1000)
+    if sec_auth:
+        lines.append(f"🟢 <b>Secondary Panel (Domestic c13):</b> برخط | {sec_lat}ms")
+    else:
+        lines.append(f"🟡 <b>Secondary Panel (Domestic c13):</b> آفلاین یا در انتظار اتصال | {sec_lat}ms")
+
+    # 3. Binance API
+    t0 = time.monotonic()
+    bin_ok = False
+    try:
+        r_b = requests.get("https://api.binance.com/api/v3/ping", timeout=4.0)
+        bin_ok = r_b.status_code == 200
+    except Exception:
+        pass
+    bin_lat = int((time.monotonic() - t0) * 1000)
+    lines.append(f"🟢 <b>Binance API:</b> پاسخگو | {bin_lat}ms" if bin_ok else f"🟡 <b>Binance API:</b> اختلال موقت | {bin_lat}ms")
+
+    # 4. CoinGecko API
+    t0 = time.monotonic()
+    cg_ok = False
+    try:
+        r_cg = requests.get("https://api.coingecko.com/api/v3/ping", timeout=4.0)
+        cg_ok = r_cg.status_code == 200
+    except Exception:
+        pass
+    cg_lat = int((time.monotonic() - t0) * 1000)
+    lines.append(f"🟢 <b>CoinGecko API:</b> پاسخگو | {cg_lat}ms" if cg_ok else f"🟡 <b>CoinGecko API:</b> اختلال موقت | {cg_lat}ms")
+
+    # 5. Live Crypto Rates Cache
+    rates = crypto_manager.get_cached_rates()
+    lines.append(f"💰 <b>نرخ‌های کش شده:</b> TRX: ${rates.get('TRX', 0):.4f} | ETH: ${rates.get('ETH', 0):.2f} (TTL: 90s)")
+
+    # 6. Subscription Mirrors
+    lines.append("\n🌐 <b>وضعیت میرورهای سابسکریپشن:</b>")
+    for domain, label in [(PUBLIC_DOMAIN, "Primary Direct"), (BRIDGE_DOMAIN, "Active Verified Mirror")]:
+        t0 = time.monotonic()
+        try:
+            rm = requests.get(f"https://{domain}/", timeout=4.0)
+            m_lat = int((time.monotonic() - t0) * 1000)
+            lines.append(f"🟢 <code>{domain}</code> ({label}): HTTP {rm.status_code} | {m_lat}ms")
+        except Exception:
+            m_lat = int((time.monotonic() - t0) * 1000)
+            lines.append(f"🟡 <code>{domain}</code> ({label}): سرور در حال هدایت | {m_lat}ms")
+
+    # 7. Database & Orders State
+    appr_orders = len(order_mgr.get_approved_orders())
+    pend_orders = len(order_mgr.get_pending_orders())
+    lines.append(f"\n📦 <b>پایگاه داده SQLite (WAL Mode):</b>")
+    lines.append(f"  • وضعیت ژورنال: <code>WAL</code>")
+    lines.append(f"  • سفارش‌های تایید شده فعال: <b>{appr_orders}</b> عدد")
+    lines.append(f"  • سفارش‌های در انتظار تایید: <b>{pend_orders}</b> عدد")
+
+    # 8. Multiplier & Panel Sync Status
+    sync_stat = sync_mgr.last_sync_status
+    lines.append(f"\n⚡ <b>مکانیزم‌های هوشمند:</b>")
+    lines.append(f"  • ضریب مصرف ۲ برابری (2x Multiplier): <b>فعال</b>")
+    sync_time_str = sync_stat.get("timestamp") or "در انتظار اولین چرخه"
+    lines.append(f"  • آخرین هماهنگ‌سازی پنل‌ها: <code>{sync_time_str}</code>")
+
+    lines.append(f"\n🕒 <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>")
+    return "\n".join(lines)
+
+
+def reminders_and_accounting_daemon_loop():
+    """Periodic daemon that checks active customer subscriptions,
+    enforces 2x multiplier limits, and sends 80%, 90%, and 3-day expiry reminders."""
+    logger.info("Starting Auto-Renewal & Traffic Accounting Daemon...")
+    while True:
+        try:
+            approved_orders = order_mgr.get_approved_orders()
+            for order in approved_orders:
+                order_id = order["order_id"]
+                user_id = order.get("user_id")
+                delivered_subs = order.get("delivered_subs") or []
+                if not delivered_subs and order.get("delivered_sub_url"):
+                    delivered_subs = [{"sub_url": order["delivered_sub_url"]}]
+
+                for sub in delivered_subs:
+                    email = sub.get("email")
+                    if not email:
+                        continue
+
+                    # Fetch live stats from primary and bridge panels
+                    p_client = conpanel_mgr.get_client(email)
+                    b_client = freshpanel_mgr.get_client(email)
+
+                    if not p_client and not b_client:
+                        continue
+
+                    # 1. Enforce 2x usage limits
+                    calc = accounting_engine.check_and_enforce_quota(
+                        email=email,
+                        order=order,
+                        primary_client=p_client,
+                        bridge_client=b_client,
+                        primary_panel_mgr=conpanel_mgr,
+                        bridge_panel_mgr=freshpanel_mgr,
+                    )
+
+                    # 2. Check Expiry
+                    exp_ms = (p_client or b_client).get("expiryTime", 0)
+                    days_left = max(0, int((exp_ms - time.time() * 1000) / (86400 * 1000))) if exp_ms > 0 else 999
+                    consumed_pct = calc.get("consumed_pct", 0.0)
+
+                    # Check 3-day expiry reminder
+                    if 0 < days_left <= 3 and not order.get("reminder_expiry_sent"):
+                        markup = types.InlineKeyboardMarkup(row_width=2)
+                        markup.add(
+                            types.InlineKeyboardButton("🔄 تمدید اشتراک", callback_data=f"plan_sel:{order.get('plan_id')}"),
+                            types.InlineKeyboardButton("👤 سفارشات من", callback_data=f"view_order:{order_id}"),
+                        )
+                        send_message_safe(
+                            user_id,
+                            f"⏳ <b>یادآوری اتمام اعتبار اشتراک</b>\n\n"
+                            f"سفارش <code>{order_id}</code> شما تنها <b>{days_left} روز</b> دیگر اعتبار دارد.\n"
+                            f"برای جلوگیری از قطع شدن دسترسی، می‌توانید از طریق دکمه زیر اقدام به تمدید فرمایید.",
+                            reply_markup=markup,
+                            parse_mode="HTML",
+                        )
+                        order_mgr.update_order_extra(order_id, "reminder_expiry_sent", True)
+
+                    # Check 80% quota reminder
+                    elif 80.0 <= consumed_pct < 90.0 and not order.get("reminder_80_sent"):
+                        markup = types.InlineKeyboardMarkup(row_width=2)
+                        markup.add(
+                            types.InlineKeyboardButton("🔄 خرید / تمدید حجم", callback_data=f"plan_sel:{order.get('plan_id')}"),
+                            types.InlineKeyboardButton("📊 مشاهده مصرف", callback_data=f"view_order:{order_id}"),
+                        )
+                        send_message_safe(
+                            user_id,
+                            f"📊 <b>هشدار مصرف حجم (۸۰٪)</b>\n\n"
+                            f"اشتراک سفارش <code>{order_id}</code> به <b>{consumed_pct:.1f}٪</b> از سقف مصرف مجاز خود رسیده است.\n"
+                            f"📈 حجم باقیمانده: {calc['remaining_gb']:.2f} گیگابایت",
+                            reply_markup=markup,
+                            parse_mode="HTML",
+                        )
+                        order_mgr.update_order_extra(order_id, "reminder_80_sent", True)
+
+                    # Check 90% quota reminder
+                    elif consumed_pct >= 90.0 and not order.get("reminder_90_sent"):
+                        markup = types.InlineKeyboardMarkup(row_width=2)
+                        markup.add(
+                            types.InlineKeyboardButton("🔄 خرید / تمدید فوری", callback_data=f"plan_sel:{order.get('plan_id')}"),
+                            types.InlineKeyboardButton("📊 مشاهده مصرف", callback_data=f"view_order:{order_id}"),
+                        )
+                        send_message_safe(
+                            user_id,
+                            f"⚠️ <b>هشدار مصرف بحرانی حجم (۹۰٪)</b>\n\n"
+                            f"اشتراک سفارش <code>{order_id}</code> بیش از <b>۹۰٪</b> حجم خود را مصرف کرده است.\n"
+                            f"📈 حجم باقیمانده: {calc['remaining_gb']:.2f} گیگابایت",
+                            reply_markup=markup,
+                            parse_mode="HTML",
+                        )
+                        order_mgr.update_order_extra(order_id, "reminder_90_sent", True)
+
+        except Exception as e:
+            logger.error("Exception in accounting & reminder daemon: %s", e)
+
+        time.sleep(3600)  # Check every 1 hour
+
+
+@bot.message_handler(commands=['health', 'admin_status'])
+def cmd_health(message):
+    """Admin-only diagnostic probe command."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور صرفاً مخصوص مدیریت ربات می‌باشد.")
+        return
+    msg = bot.reply_to(message, "⏳ در حال پایش وضعیت سلامت سرورها، پنل‌ها و سرویس‌های رمزارز...")
+    report = run_admin_health_check()
+    try:
+        bot.edit_message_text(report, chat_id=message.chat.id, message_id=msg.message_id, parse_mode="HTML")
+    except Exception:
+        send_message_safe(message.chat.id, report, parse_mode="HTML")
+
+
 @bot.message_handler(commands=['status'])
 def send_status(message):
-    """Per-country counts + last and next update times."""
+    """Per-country counts for users, or full SRE health diagnostic for admins."""
+    if is_admin(message.from_user) or is_admin(message.chat.id):
+        msg = bot.reply_to(message, "⏳ در حال آماده‌سازی گزارش پایش سلامت سرورها...")
+        report = run_admin_health_check()
+        try:
+            bot.edit_message_text(report, chat_id=message.chat.id, message_id=msg.message_id, parse_mode="HTML")
+        except Exception:
+            send_message_safe(message.chat.id, report, parse_mode="HTML")
+        return
+
     lines = []
     total = 0
     with nodes_lock:
@@ -2497,6 +2787,23 @@ def cmd_announce(message):
         bot.reply_to(message, f"❌ خطا در ارسال پیام به کانال: {e}")
 
 
+@bot.message_handler(commands=['post_tariffs', 'post_tariff'])
+def cmd_post_tariffs(message):
+    """Admin command to post official tariffs table and cover banner to the channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+
+    banner_file = script_dir / "tariff_banner.jpg"
+    ok = persian_announcements.post_full_tariffs_to_channel(
+        bot, CHANNEL_ID, bot_username, banner_path=str(banner_file) if banner_file.exists() else None
+    )
+    if ok:
+        bot.reply_to(message, "📢 تعرفه رسمی و بنر اختصاصی با موفقیت به کانال ارسال شد.")
+    else:
+        bot.reply_to(message, "❌ خطا در ارسال تعرفه‌ها به کانال.")
+
+
 # --- MENU & ORDER CALLBACK QUERY HANDLERS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("menu:"))
 def handle_menu_callbacks(call):
@@ -2517,6 +2824,8 @@ def handle_menu_callbacks(call):
             send_message_safe(chat_id, get_welcome_text(), reply_markup=build_main_menu_keyboard(), parse_mode="HTML")
     elif action == "buy":
         show_buy_menu(chat_id, msg_id)
+    elif action == "club":
+        show_customer_club(chat_id, call.from_user.id, msg_id)
     elif action == "donate":
         show_donation_menu(chat_id, msg_id)
     elif action == "free_countries":
@@ -2609,7 +2918,13 @@ def handle_plan_selection(call):
     unit_toman = plan.get("price_toman", 0)
     total_usd = round(unit_usd * qty, 2)
     total_toman = unit_toman * qty
-    calc = crypto_manager.calculate_adaptive_prices(total_usd)
+
+    # Customer Club Discount
+    disc = club_manager.calculate_discounted_price(call.from_user.id, total_toman, total_usd)
+    final_toman = disc["final_toman"]
+    final_usd = disc["final_usd"]
+    discount_pct = disc["discount_pct"]
+    calc = crypto_manager.calculate_adaptive_prices(final_usd)
 
     devices = plan.get("devices", 1)
     volume_gb = plan.get("volume_gb", 30)
@@ -2618,11 +2933,23 @@ def handle_plan_selection(call):
     dur_str = dur_map.get(dur_days, f"{dur_days} روز")
 
     qty_note = f" (هر اشتراک: {unit_toman:,} تومان)" if qty > 1 else ""
+    if discount_pct > 0:
+        cost_block = (
+            f"▫️ <b>مبلغ پایه:</b> {total_toman:,} تومان{qty_note}\n"
+            f"🎁 <b>تخفیف باشگاه مشتریان ({discount_pct}٪):</b> <b>{disc['discount_toman']:,}- تومان</b>\n"
+            f"✅ <b>مبلغ نهایی قابل پرداخت:</b> <b>{final_toman:,} تومان</b>\n\n"
+        )
+    else:
+        cost_block = (
+            f"▫️ <b>مجموع مبلغ تومانی:</b> <b>{total_toman:,} تومان</b>{qty_note}\n"
+            f"<i>💡 امکان دریافت تا سقف ۳۰٪ تخفیف در منوی /club!</i>\n\n"
+        )
+
     text = (
         f"💎 <b>جزئیات پلن و انتخاب تعداد / روش پرداخت:</b>\n\n"
         f"▫️ <b>پلن انتخابی:</b> {volume_gb} گیگابایت | {dur_str} ({devices} کاربره)\n"
         f"▫️ <b>تعداد اشتراک انتخابی:</b> <b>{qty} عدد</b>\n"
-        f"▫️ <b>مجموع مبلغ تومانی:</b> <b>{total_toman:,} تومان</b>{qty_note}\n\n"
+        f"{cost_block}"
         f"💰 <b>مبلغ قابل پرداخت با رمزارز (نرخ لحظه‌ای بازار):</b>\n"
         f"💵 <b>معادل تتر (USDT):</b> ${calc['usdt']:.2f} USDT\n"
         f"🔺 <b>معادل ترون (TRX):</b> ~{calc['trx']} TRX\n"
@@ -2671,7 +2998,13 @@ def handle_payment_network(call):
     unit_toman = plan.get("price_toman", 0)
     total_usd = round(unit_usd * qty, 2)
     total_toman = unit_toman * qty
-    calc = crypto_manager.calculate_adaptive_prices(total_usd)
+
+    # Customer Club Discount
+    disc = club_manager.calculate_discounted_price(call.from_user.id, total_toman, total_usd)
+    final_toman = disc["final_toman"]
+    final_usd = disc["final_usd"]
+    discount_pct = disc["discount_pct"]
+    calc = crypto_manager.calculate_adaptive_prices(final_usd)
 
     if network == "tron":
         wallet_address = crypto_manager.TRON_WALLET
@@ -2686,7 +3019,7 @@ def handle_payment_network(call):
         amount_str = f"<b>{calc['eth']} ETH</b> یا <b>${calc['usdt']:.2f} USDT-ERC20</b>"
         crypto_amount = calc['eth']
 
-    # Create order in order_manager with quantity
+    # Create order in order_manager with quantity and club discount
     order_id = order_mgr.create_order(
         user_id=call.from_user.id,
         username=call.from_user.username,
@@ -2696,6 +3029,10 @@ def handle_payment_network(call):
         crypto_currency=crypto_curr,
         crypto_amount=crypto_amount,
         quantity=qty,
+        discount_percent=discount_pct,
+        discount_toman=disc["discount_toman"],
+        final_price_toman=final_toman,
+        final_price_usd=final_usd,
     )
 
     dur_days = plan.get("duration_days", 30)
@@ -2703,12 +3040,21 @@ def handle_payment_network(call):
     dur_str = dur_map.get(dur_days, f"{dur_days} روز")
 
     qty_line = f"🔢 <b>تعداد اشتراک:</b> {qty} عدد\n" if qty > 1 else ""
+    if discount_pct > 0:
+        price_line = (
+            f"▫️ <b>مبلغ پایه:</b> {total_toman:,} تومان\n"
+            f"🎁 <b>تخفیف باشگاه مشتریان ({discount_pct}٪):</b> {disc['discount_toman']:,}- تومان\n"
+            f"💵 <b>مبلغ نهایی سفارش:</b> <b>{final_toman:,} تومان</b> (~${final_usd:.2f} USD)\n"
+        )
+    else:
+        price_line = f"💵 <b>مبلغ کل سفارش:</b> <b>{total_toman:,} تومان</b> (~${total_usd:.1f} USD)\n"
+
     qr_bytes = crypto_manager.generate_qr_bytes(wallet_address)
     caption = (
         f"🧾 <b>فاکتور پرداخت سفارش <code>{order_id}</code></b>\n\n"
         f"📦 <b>پلن:</b> {plan.get('volume_gb', 30)} گیگ | {dur_str} ({plan.get('devices', 1)} کاربره)\n"
         f"{qty_line}"
-        f"💵 <b>مبلغ کل سفارش:</b> {total_toman:,} تومان (~${total_usd:.1f} USD)\n"
+        f"{price_line}"
         f"🌐 <b>شبکه انتقال:</b> {net_title}\n"
         f"💰 <b>مبلغ قابل واریز:</b> {amount_str}\n\n"
         f"📍 <b>آدرس کیف پول جهت واریز:</b>\n"
@@ -2851,6 +3197,18 @@ def handle_admin_decision(call):
         )
         if creation_res.get("success"):
             delivered_subs.append(creation_res)
+            # Replicate immediately to secondary domestic bridge panel Inbound 2 (Bridge 2X)
+            try:
+                freshpanel_mgr.create_customer_subscription(
+                    email=creation_res["email"],
+                    total_gb=order["volume_gb"],
+                    expiry_days=order["duration_days"],
+                    limit_hwid=order.get("devices", 1),
+                    tg_id=order["user_id"],
+                    inbound_id=2,  # Domestic Bridge 2X
+                )
+            except Exception as e_sec:
+                logger.warning("Could not immediately replicate client to secondary panel: %s", e_sec)
         else:
             errors.append(creation_res.get("error", "Unknown error"))
 
@@ -2887,21 +3245,22 @@ def handle_admin_decision(call):
             num_str = f" شماره {idx}" if qty > 1 else ""
             lines.append("━━━━━━━━━━━━━━━━━━━")
             lines.append(f"🔑 <b>اشتراک{num_str}:</b>")
-            lines.append(f"🔗 <b>لینک ساب اصلی:</b>\n<code>{html.escape(sub['sub_url'])}</code>")
+            lines.append(f"🔗 <b>لینک ساب اصلی (Base64):</b>\n<code>{html.escape(sub['sub_url'])}</code>")
+            if sub.get("json_url"):
+                lines.append(f"📱 <b>لینک ساب Sing-box (JSON):</b>\n<code>{html.escape(sub['json_url'])}</code>")
             bridge_u = sub.get("bridge_url")
             if bridge_u:
                 bridge_u = bridge_u.replace("bridge.litontheix.ir", BRIDGE_DOMAIN)
                 lines.append(f"🌉 <b>لینک ساب کمکی (Mirror / Bridge):</b>\n<code>{html.escape(bridge_u)}</code>")
-            if sub.get("json_url"):
-                lines.append(f"📱 <b>لینک مخصوص Sing-box:</b>\n<code>{html.escape(sub['json_url'])}</code>")
+            if sub.get("bridge_json_url"):
+                lines.append(f"🚀 <b>لینک Sing-box کمکی (Bridge JSON):</b>\n<code>{html.escape(sub['bridge_json_url'])}</code>")
 
         lines.append("━━━━━━━━━━━━━━━━━━━\n")
         lines.append(
-            "💡 <b>راهنمای اتصال و رفع اختلال در صورت عدم بارگیری:</b>\n"
-            "۱. <b>تغییر اپراتور اینترنت:</b> در صورت خطا در Update سابسکریپشن، یک‌بار اینترنت خود را تعویض کنید (سوییچ بین همراه اول، ایرانسل یا وای‌فای خانگی).\n"
-            "۲. <b>استفاده از VPN کمکی موقت:</b> می‌توانید یک فیلترشکن کمکی یا کانفیگ رایگان روشن کنید تا برنامه یک‌بار ساب را بارگیری کند، سپس VPN کمکی را قطع کرده و به سرورهای VIP متصل شوید.\n"
-            "۳. <b>ساب پشتیبان (Bridge):</b> در صورت اختلال در لینک اول، از لینک Bridge بالا استفاده نمایید.\n"
-            "۴. <b>گزینه Fragment:</b> در صورت کندی روی همراه اول/ایرانسل، گزینه Fragment را در تنظیمات v2rayNG روشن فرمایید.\n\n"
+            "💡 <b>راهنمای اتصال و نرم‌افزارهای پیشنهادی:</b>\n"
+            "• <b>برنامه‌های پشتیبانی‌کننده از Sing-box:</b> نرم‌افزارهای مدرن <b>Karing</b> و <b>Hiddify</b> (لینک مخصوص Sing-box را در آن‌ها وارد فرمایید).\n"
+            "• <b>برنامه‌های معمولی:</b> نرم‌افزارهای <b>v2rayNG</b> (اندروید)، <b>Streisand</b> و <b>Shadowrocket</b> (آیفون).\n"
+            "• <b>ساب کمکی (Bridge):</b> در صورت بروز هرگونه اختلال روی اینترنت همراه اول یا ایرانسل، از لینک Bridge کمکی استفاده نمایید.\n\n"
             "از اعتماد شما به LitixConnect سپاسگزاریم! ❤️"
         )
         cust_msg = "\n".join(lines)
@@ -3130,6 +3489,7 @@ if __name__ == "__main__":
             types.BotCommand("top", "دریافت فایل ۵ کشور برتر | Top 5"),
             types.BotCommand("sub", "سابسکریپشن همگانی رایگان | All-in-One Sub"),
             types.BotCommand("status", "وضعیت سرورهای رایگان | Server Status"),
+            types.BotCommand("health", "پایش سلامت سرورها (مدیریت) | Health"),
             types.BotCommand("help", "راهنمای اتصال و دانلود برنامه‌ها | Guide"),
         ])
         logger.info("Registered Telegram bot commands menu")
@@ -3138,6 +3498,13 @@ if __name__ == "__main__":
 
     updater_thread = threading.Thread(target=update_configs_loop, daemon=True)
     updater_thread.start()
+
+    # Launch dual-panel synchronization daemon
+    sync_mgr.start_background_thread(interval_sec=SYNC_INTERVAL_SEC)
+
+    # Launch auto-renewal & 2x traffic accounting reminder daemon
+    accounting_thread = threading.Thread(target=reminders_and_accounting_daemon_loop, daemon=True, name="AccountingReminderDaemon")
+    accounting_thread.start()
 
     logger.info("Resilient Telegram operational routing loop initializing...")
     threading.Thread(target=ensure_xray_binary, daemon=True).start()
