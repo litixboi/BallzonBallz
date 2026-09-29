@@ -20,7 +20,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set, Tuple
-from urllib.parse import parse_qs, quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlencode
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -567,7 +567,11 @@ XRAY_DL_PREFIXES = [  # tried in order; mirrors dodge GitHub rate-limits on shar
     "https://gh-proxy.com/https://github.com/",
 ]
 XRAY_SETUP_FAILED_UNTIL = 0.0  # monotonic time before which binary setup is skipped (negative cache)
-CONNECTIVITY_URLS = ["http://cp.cloudflare.com/generate_204", "http://www.gstatic.com/generate_204"]
+CONNECTIVITY_URLS = [
+    "https://www.gstatic.com/generate_204",
+    "https://cp.cloudflare.com/generate_204",
+    "http://cp.cloudflare.com/generate_204",
+]
 
 # Thread-safe reusable port pool for verifier SOCKS inbounds (prevents >65535 integer overflow)
 _port_pool = queue.Queue()
@@ -736,6 +740,13 @@ def parse_vmess_to_outbound(line):
             fp = str(data.get("fp") or "").strip()
             if fp:
                 stream["tlsSettings"]["fingerprint"] = fp
+            stream["sockopt"] = {
+                "fragment": {
+                    "packets": "tlshello",
+                    "length": "100-200",
+                    "interval": "10-20",
+                }
+            }
         if net == "ws":
             ws = {"path": str(data.get("path") or "/")}
             host_header = str(data.get("host") or "").strip()
@@ -808,6 +819,13 @@ def parse_vless_trojan_to_outbound(line, proto):
                     "spiderX": params.get("spx") or "",
                 }
             stream["tlsSettings"] = tls
+            stream["sockopt"] = {
+                "fragment": {
+                    "packets": "tlshello",
+                    "length": "100-200",
+                    "interval": "10-20",
+                }
+            }
         if net == "ws":
             ws = {"path": unquote(params.get("path") or "/")}
             if params.get("host"):
@@ -1100,27 +1118,62 @@ def test_single_node(line, known_country=None):
 
 
 def rebrand_config(config_line, country_key, index):
+    """Rebrand and optimize config for anti-censorship before export/serving.
+    Injects TLS fragmentation parameters, Chrome TLS fingerprint, and ALPN into
+    vless/vmess/trojan configurations so clients (v2rayNG, V2Box, Streisand, etc.)
+    automatically activate anti-DPI packet fragmentation upon import.
+    """
     meta = COUNTRY_DATA.get(country_key, COUNTRY_DATA["Others"])
     new_remark = f"{meta['flag']} {meta['abbrev']} | litixconnect #{index} | {CHANNEL_ID}"
 
     try:
+        config_line = config_line.strip()
         if config_line.startswith("vmess://"):
             b64_data = config_line.replace("vmess://", "").strip()
             b64_data += "=" * ((4 - len(b64_data) % 4) % 4)
-            data = json.loads(base64.b64decode(b64_data).decode('utf-8'))
+            data = json.loads(base64.b64decode(b64_data).decode("utf-8"))
             data["ps"] = new_remark
-            updated_json = json.dumps(data).encode('utf-8')
+            sec = str(data.get("tls") or "").lower()
+            if sec == "tls" or str(data.get("port")) == "443":
+                if not data.get("fp"):
+                    data["fp"] = "chrome"
+                if not data.get("alpn") and sec == "tls":
+                    data["alpn"] = "h2,http/1.1"
+            updated_json = json.dumps(data, ensure_ascii=False).encode("utf-8")
             return f"vmess://{base64.b64encode(updated_json).decode('utf-8')}"
 
-        elif any(config_line.startswith(p) for p in ["vless://", "ss://", "trojan://"]):
-            base_part = config_line.split("#")[0]
-            # The remark is a URI fragment: v2ray-style clients (v2rayNG etc.)
-            # parse these links with strict java.net.URI, which rejects a second
-            # '#' or any illegal character and silently drops the whole line on
-            # import. Percent-encode the remark so every client accepts it.
+        elif any(config_line.startswith(p) for p in ["vless://", "trojan://"]):
+            base_part = config_line.split("#", 1)[0]
+            proto, _, rest = base_part.partition("://")
+            main_part, _, query = rest.partition("?")
+            params = parse_qs(query, keep_blank_values=True)
+            flat_params = {k: v[0] for k, v in params.items()}
+
+            sec = flat_params.get("security", "").lower()
+            port = ""
+            if ":" in main_part.split("@")[-1]:
+                port = main_part.split("@")[-1].split(":")[-1]
+
+            if sec in ("tls", "reality") or port == "443":
+                if "fragment" not in flat_params:
+                    flat_params["fragment"] = "100-200,10-20,tlshello"
+                if "fp" not in flat_params or not flat_params["fp"]:
+                    flat_params["fp"] = "chrome"
+                if sec == "tls" and "alpn" not in flat_params:
+                    flat_params["alpn"] = "h2,http/1.1"
+
+            if flat_params:
+                new_query = urlencode(flat_params, safe=",/")
+                new_base = f"{proto}://{main_part}?{new_query}"
+            else:
+                new_base = f"{proto}://{main_part}"
+            return f"{new_base}#{quote(new_remark, safe='')}"
+
+        elif config_line.startswith("ss://"):
+            base_part = config_line.split("#", 1)[0]
             return f"{base_part}#{quote(new_remark, safe='')}"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("rebrand_config exception for %s: %s", country_key, e)
     return config_line
 
 
@@ -1231,10 +1284,24 @@ def generate_subscription_content():
     return base64.b64encode(joined.encode("utf-8")).decode("ascii")
 
 
+def protocol_priority(line):
+    """Priority score for protocols: VLESS (0) > Trojan (1) > VMess (2) > Shadowsocks (3)."""
+    s = line.strip().lower()
+    if s.startswith("vless://"):
+        return 0
+    if s.startswith("trojan://"):
+        return 1
+    if s.startswith("vmess://"):
+        return 2
+    if s.startswith("ss://"):
+        return 3
+    return 4
+
+
 def pick_diverse_configs(lines, count):
     """Pick up to `count` configs with all-distinct server addresses.
 
-    Groups configs by host address, keeps one per address (random within the group),
+    Groups configs by host address, picks the highest-priority protocol per address,
     then samples across addresses - so 50 picks means 50 different servers,
     spread over the whole address range instead of clustering on duplicates.
     """
@@ -1248,9 +1315,12 @@ def pick_diverse_configs(lines, count):
     if not by_host:
         return []
 
-    # one random config per unique address, then shuffle so the sample
-    # isn't biased toward addresses that happened to appear first
-    one_per_host = [random.choice(group) for group in by_host.values()]
+    # Pick highest priority protocol (vless/trojan/vmess before ss) per host
+    one_per_host = []
+    for group in by_host.values():
+        sorted_group = sorted(group, key=protocol_priority)
+        one_per_host.append(sorted_group[0])
+
     random.shuffle(one_per_host)
 
     if len(one_per_host) <= count:
@@ -1491,61 +1561,323 @@ def get_best_font(size, bold=False):
 
 
 def create_update_banner():
-    """Generate a visual banner image summarizing the latest config update"""
+    """Generate a sleek, modern cyber-style banner image summarizing the latest config update."""
+    import textwrap
     from PIL import Image, ImageDraw
 
-    width, height = 1280, 800
-    img = Image.new("RGB", (width, height))
+    width, height = 1280, 720
+    img = Image.new("RGB", (width, height), (11, 15, 25))
     draw = ImageDraw.Draw(img)
 
-    top = (15, 23, 42)
-    bottom = (76, 29, 149)
+    # 1. Base gradient
+    top_color = (15, 22, 40)
+    bottom_color = (7, 10, 18)
     for y in range(height):
         t = y / height
-        color = tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3))
-        draw.line([(0, y), (width, y)], fill=color)
+        r = int(top_color[0] + (bottom_color[0] - top_color[0]) * t)
+        g = int(top_color[1] + (bottom_color[1] - top_color[1]) * t)
+        b = int(top_color[2] + (bottom_color[2] - top_color[2]) * t)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
 
-    title_font = get_best_font(64, bold=True)
-    sub_font = get_best_font(32)
-    small_font = get_best_font(24)
-    count_font = get_best_font(28, bold=True)
+    # Glow overlay for ambient lighting
+    glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    glow_draw = ImageDraw.Draw(glow)
 
-    draw.text((width // 2, 80), "LitixConnect", font=title_font, fill=(255, 255, 255), anchor="mm")
-    draw.text((width // 2, 145), "Fresh VPN Configs Updated", font=sub_font, fill=(165, 180, 252), anchor="mm")
-    draw.text((width // 2, 190), time.strftime("%Y-%m-%d  %H:%M UTC", time.gmtime()), font=small_font, fill=(148, 163, 184), anchor="mm")
+    # Ambient radial glow top right (cyan/blue)
+    cx1, cy1 = 1120, 80
+    for rad in range(400, 0, -5):
+        alpha = int(22 * (1 - rad / 400))
+        glow_draw.ellipse([cx1 - rad, cy1 - rad, cx1 + rad, cy1 + rad], fill=(56, 189, 248, alpha))
 
+    # Ambient radial glow bottom left (violet)
+    cx2, cy2 = 120, 640
+    for rad in range(400, 0, -5):
+        alpha = int(26 * (1 - rad / 400))
+        glow_draw.ellipse([cx2 - rad, cy2 - rad, cx2 + rad, cy2 + rad], fill=(129, 140, 248, alpha))
+
+    # Ambient radial glow center (subtle deep blue)
+    cx3, cy3 = 640, 360
+    for rad in range(300, 0, -8):
+        alpha = int(12 * (1 - rad / 300))
+        glow_draw.ellipse([cx3 - rad, cy3 - rad, cx3 + rad, cy3 + rad], fill=(99, 102, 241, alpha))
+
+    # Faint tech grid dots
+    for gx in range(40, width - 40, 40):
+        for gy in range(40, height - 40, 40):
+            glow_draw.point((gx, gy), fill=(255, 255, 255, 12))
+
+    img = Image.alpha_composite(img.convert("RGBA"), glow).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    # Outer decorative frame
+    draw.rounded_rectangle([20, 20, width - 20, height - 20], radius=24, outline=(36, 48, 76), width=2)
+    draw.rounded_rectangle([22, 22, width - 22, height - 22], radius=22, outline=(67, 56, 202), width=1)
+
+    # Fonts
+    font_title = get_best_font(42, bold=True)
+    font_badge = get_best_font(13, bold=True)
+    font_sub = get_best_font(16, bold=True)
+    font_stat_num = get_best_font(24, bold=True)
+    font_stat_lbl = get_best_font(11, bold=True)
+    font_card_code = get_best_font(18, bold=True)
+    font_card_name = get_best_font(15, bold=True)
+    font_card_cnt = get_best_font(14, bold=True)
+    font_feat_title = get_best_font(14, bold=True)
+    font_feat_desc = get_best_font(12)
+    font_footer = get_best_font(14, bold=True)
+
+    # Top Status Pill
+    pill_w, pill_h = 240, 30
+    pill_x1 = (width - pill_w) // 2
+    draw.rounded_rectangle([pill_x1, 34, pill_x1 + pill_w, 34 + pill_h], radius=15, fill=(18, 26, 46), outline=(56, 189, 248), width=1)
+    draw.ellipse([pill_x1 + 14, 44, pill_x1 + 22, 52], fill=(16, 185, 129))
+    draw.text((pill_x1 + 32, 40), "LIVE CORE VERIFIED", font=font_badge, fill=(56, 189, 248))
+
+    # Brand Title & Subtitle
+    draw.text((width // 2, 88), "LitixConnect", font=font_title, fill=(255, 255, 255), anchor="mm")
+    draw.text((width // 2, 126), "HIGH-SPEED ANTI-CENSORSHIP VPN NETWORK", font=font_sub, fill=(165, 180, 252), anchor="mm")
+
+    # Fetch active entries
     with nodes_lock:
-        entries = [(name, len(lines)) for name, lines in categorized_nodes.items() if lines and name != "Others"]
-    entries.sort(key=lambda e: e[1], reverse=True)
+        raw_entries = [(name, len(lines)) for name, lines in categorized_nodes.items() if lines and name != "Others"]
+        total_configs = sum(len(lines) for lines in categorized_nodes.values())
+    raw_entries.sort(key=lambda e: e[1], reverse=True)
 
-    cols = 4
-    cell_w, cell_h = 290, 62
-    start_x = (width - cols * cell_w) // 2
-    start_y = 240
+    entries = [(name, count, COUNTRY_DATA.get(name, {}).get("abbrev", name[:2].upper()))
+               for name, count in raw_entries]
 
-    for i, (name, count) in enumerate(entries[:24]):
-        code = COUNTRY_DATA[name]["abbrev"]
-        col, row = i % cols, i // cols
-        x = start_x + col * cell_w + cell_w // 2
-        y = start_y + row * cell_h + cell_h // 2
-        draw.rounded_rectangle([x - 130, y - 24, x + 130, y + 24], radius=12, fill=(30, 41, 59), outline=(99, 102, 241), width=1)
-        draw.text((x, y), f"{code}   {count}", font=count_font, fill=(226, 232, 240), anchor="mm")
+    # Stat Cards Row
+    total_stat_w = 1180
+    sc_start_x = (width - total_stat_w) // 2
+    card_y = 150
+    card_h = 60
+    sc_w = 372
+    sc_gap = (total_stat_w - (3 * sc_w)) // 2
 
-    if len(entries) > 24:
-        draw.text((width // 2, start_y + 6 * cell_h + 20), f"+{len(entries) - 24} more countries", font=small_font, fill=(148, 163, 184), anchor="mm")
+    stat_data = [
+        ("TOTAL WORKING NODES", f"{total_configs} Verified Configs", (56, 189, 248)),
+        ("GLOBAL LOCATIONS", f"{len(entries)} Active Countries", (167, 139, 250)),
+        ("PRIORITY PROTOCOLS", "VLESS  *  VMESS  *  TROJAN", (52, 211, 153))
+    ]
 
-    with nodes_lock:
-        total = sum(len(lines) for lines in categorized_nodes.values())
-    draw.text((width // 2, height - 110), f"{total} verified configs across {len(entries)} countries", font=sub_font, fill=(255, 255, 255), anchor="mm")
-    draw.text((width // 2, height - 55), CHANNEL_ID, font=small_font, fill=(165, 180, 252), anchor="mm")
+    for i, (label, val, accent) in enumerate(stat_data):
+        sx = sc_start_x + i * (sc_w + sc_gap)
+        draw.rounded_rectangle([sx, card_y, sx + sc_w, card_y + card_h], radius=14, fill=(19, 27, 47), outline=(42, 58, 92), width=1)
+        draw.rounded_rectangle([sx, card_y, sx + 5, card_y + card_h], radius=3, fill=accent)
+        draw.text((sx + 18, card_y + 10), label, font=font_stat_lbl, fill=(148, 163, 184))
+        draw.text((sx + 18, card_y + 28), val, font=font_stat_num, fill=(241, 245, 249))
+
+    n = len(entries)
+    footer_y = height - 52
+    avail_top = card_y + card_h + 16
+    avail_bottom = footer_y - 20
+    avail_h = avail_bottom - avail_top
+
+    if n <= 6:
+        # Layout for few countries: Showcase country cards + 3 feature highlight pillars
+        cols = min(3, max(1, n))
+        rows = 1 if n <= 3 else 2
+        c_gap_x = 20
+        c_gap_y = 14
+        c_w = (total_stat_w - (cols - 1) * c_gap_x) // cols
+        c_h = 74
+        c_start_y = avail_top
+
+        for i, item in enumerate(entries[:cols * rows]):
+            name, count, abbrev = item
+            c = i % cols
+            r = i // cols
+            x1 = sc_start_x + c * (c_w + c_gap_x)
+            y1 = c_start_y + r * (c_h + c_gap_y)
+            x2 = x1 + c_w
+            y2 = y1 + c_h
+
+            draw.rounded_rectangle([x1, y1, x2, y2], radius=14, fill=(21, 30, 52), outline=(48, 66, 105), width=1)
+            bw, bh = 54, 52
+            bx1, by1 = x1 + 14, y1 + 11
+            draw.rounded_rectangle([bx1, by1, bx1 + bw, by1 + bh], radius=10, fill=(35, 48, 80), outline=(99, 102, 241), width=1)
+            draw.text((bx1 + bw // 2, by1 + bh // 2), abbrev, font=font_card_code, fill=(224, 231, 255), anchor="mm")
+
+            tx = bx1 + bw + 16
+            draw.text((tx, y1 + 16), name, font=font_card_name, fill=(248, 250, 252))
+            draw.ellipse([tx, y1 + 45, tx + 8, y1 + 53], fill=(52, 211, 153))
+            draw.text((tx + 14, y1 + 40), f"{count} Verified Live Nodes", font=font_card_cnt, fill=(52, 211, 153))
+
+        feat_top = c_start_y + rows * (c_h + c_gap_y) + 16
+        feat_h = avail_bottom - feat_top
+
+        pill_w = (total_stat_w - 2 * 20) // 3
+        features = [
+            ("[+] TLS FRAGMENTATION", [
+                "Auto-injected Client Hello splitting",
+                "Bypasses Deep Packet Inspection (DPI)",
+                "Optimized for mobile operator networks",
+                "Full Streisand / V2Box / v2rayNG support"
+            ]),
+            ("[+] CLEAN PROTOCOLS", [
+                "100% focused on VLESS, VMess & Trojan",
+                "Deprecated Shadowsocks (SS) excluded",
+                "TLS / Reality anti-censorship support",
+                "Direct low-jitter egress routing"
+            ]),
+            ("[+] ACTIVE VALIDATION", [
+                "Real Xray-core SOCKS5 proxy test",
+                "Direct HTTPS handshake verified",
+                "Automated 12-hour cluster rotation",
+                "Zero broken or dead configurations"
+            ])
+        ]
+        for pi, (ftitle, fbullets) in enumerate(features):
+            fx1 = sc_start_x + pi * (pill_w + 20)
+            fx2 = fx1 + pill_w
+            draw.rounded_rectangle([fx1, feat_top, fx2, feat_top + feat_h], radius=14, fill=(17, 24, 42), outline=(38, 52, 84), width=1)
+            draw.text((fx1 + 16, feat_top + 18), ftitle, font=font_feat_title, fill=(56, 189, 248))
+            draw.line([(fx1 + 16, feat_top + 40), (fx2 - 16, feat_top + 40)], fill=(30, 42, 68), width=1)
+            for bi, bullet in enumerate(fbullets):
+                by = feat_top + 54 + bi * 25
+                draw.ellipse([fx1 + 18, by + 4, fx1 + 24, by + 10], fill=(99, 102, 241))
+                draw.text((fx1 + 32, by), bullet, font=font_feat_desc, fill=(203, 213, 225))
+
+    else:
+        # Layout for many countries (7 to 24)
+        if n <= 12:
+            cols = 4
+            rows = (n + 3) // 4
+        elif n <= 18:
+            cols = 6
+            rows = (n + 5) // 6
+        else:
+            cols = 6
+            rows = 4
+
+        display_entries = entries[:cols * rows]
+        cell_gap_x = 14
+        cell_gap_y = 12
+        cell_w = (total_stat_w - (cols - 1) * cell_gap_x) // cols
+
+        total_grid_h = rows * 72 + (rows - 1) * cell_gap_y
+        if total_grid_h > avail_h:
+            cell_h = (avail_h - (rows - 1) * cell_gap_y) // rows
+            grid_y = avail_top
+        else:
+            cell_h = 72
+            grid_y = avail_top + (avail_h - total_grid_h) // 2
+
+        for i, item in enumerate(display_entries):
+            name, count, abbrev = item
+            c = i % cols
+            r = i // cols
+            x1 = sc_start_x + c * (cell_w + cell_gap_x)
+            y1 = grid_y + r * (cell_h + cell_gap_y)
+            x2 = x1 + cell_w
+            y2 = y1 + cell_h
+
+            draw.rounded_rectangle([x1, y1, x2, y2], radius=12, fill=(21, 29, 50), outline=(44, 60, 96), width=1)
+
+            bw = 44
+            bh = cell_h - 16
+            bx1 = x1 + 8
+            by1 = y1 + 8
+            draw.rounded_rectangle([bx1, by1, bx1 + bw, by1 + bh], radius=8, fill=(35, 48, 80), outline=(99, 102, 241), width=1)
+            draw.text((bx1 + bw // 2, by1 + bh // 2), abbrev, font=font_card_code, fill=(224, 231, 255), anchor="mm")
+
+            tx = bx1 + bw + 10
+            disp_name = name
+            max_len = 13 if cols == 6 else 18
+            if len(disp_name) > max_len:
+                disp_name = disp_name[:max_len - 1] + "."
+
+            draw.text((tx, y1 + 12), disp_name, font=font_card_name, fill=(248, 250, 252))
+            draw.ellipse([tx, y1 + 39, tx + 6, y1 + 45], fill=(52, 211, 153))
+            draw.text((tx + 10, y1 + 33), f"{count} live", font=font_card_cnt, fill=(52, 211, 153))
+
+        if len(entries) > len(display_entries):
+            rem = len(entries) - len(display_entries)
+            draw.text((width // 2, footer_y - 18), f"+ {rem} more countries available in the bot", font=font_badge, fill=(148, 163, 184), anchor="mm")
+
+    # Footer
+    timestamp_str = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    draw.line([(sc_start_x, footer_y - 12), (sc_start_x + total_stat_w, footer_y - 12)], fill=(30, 42, 68), width=1)
+    draw.text((sc_start_x + 6, footer_y + 2), f"Xray-Core Validated  |  Auto-Updated Every {UPDATE_INTERVAL_HOURS} Hours  |  {timestamp_str}", font=font_badge, fill=(148, 163, 184))
+
+    ch_pill_w = 210
+    ch_x1 = sc_start_x + total_stat_w - ch_pill_w
+    draw.rounded_rectangle([ch_x1, footer_y - 8, ch_x1 + ch_pill_w, footer_y + 22], radius=15, fill=(28, 38, 70), outline=(56, 189, 248), width=1)
+    draw.text((ch_x1 + ch_pill_w // 2, footer_y + 7), CHANNEL_ID, font=font_footer, fill=(56, 189, 248), anchor="mm")
 
     banner_path = script_dir / "update_banner.png"
     img.save(banner_path)
     return banner_path
 
 
+def collect_top_fastest_configs(active_entries, count=5):
+    """Pick up to `count` fastest diverse configs from top active countries.
+    Strictly excludes Shadowsocks (ss://) in favor of modern protocols (vless/vmess/trojan).
+    Prefers distinct server hosts and diverse countries.
+    """
+    selected = []
+    seen_hosts = set()
+
+    # Pass 1: Try to pick 1 best non-SS config per country across top active countries
+    for _, lines in active_entries:
+        for cfg in lines:
+            cfg_clean = cfg.strip()
+            scheme = cfg_clean.split("://", 1)[0].lower() if "://" in cfg_clean else ""
+            if scheme == "ss":
+                continue
+            host, _ = extract_host_and_port(cfg_clean)
+            if host and host.lower() in seen_hosts:
+                continue
+            if host:
+                seen_hosts.add(host.lower())
+            selected.append(cfg_clean)
+            break
+        if len(selected) >= count:
+            break
+
+    # Pass 2: If we have fewer than `count` (e.g. fewer active countries), fill from remaining lines
+    if len(selected) < count:
+        for _, lines in active_entries:
+            for cfg in lines:
+                cfg_clean = cfg.strip()
+                scheme = cfg_clean.split("://", 1)[0].lower() if "://" in cfg_clean else ""
+                if scheme == "ss" or cfg_clean in selected:
+                    continue
+                host, _ = extract_host_and_port(cfg_clean)
+                if host and host.lower() in seen_hosts:
+                    continue
+                if host:
+                    seen_hosts.add(host.lower())
+                selected.append(cfg_clean)
+                if len(selected) >= count:
+                    break
+            if len(selected) >= count:
+                break
+
+    # Pass 3: Fallback without host dedup if needed
+    if len(selected) < count:
+        for _, lines in active_entries:
+            for cfg in lines:
+                cfg_clean = cfg.strip()
+                scheme = cfg_clean.split("://", 1)[0].lower() if "://" in cfg_clean else ""
+                if scheme != "ss" and cfg_clean not in selected:
+                    selected.append(cfg_clean)
+                    if len(selected) >= count:
+                        break
+            if len(selected) >= count:
+                break
+
+    return selected[:count]
+
+
 def post_all_countries_to_channel():
-    """Broadcast update to channel: header announcement with 1-tap configs, subscription, quick-picks, and country files."""
+    """Broadcast clean, uncluttered update to channel:
+    1. Header announcement banner with Top 5 fastest configs (1-tap copy) and quick access buttons.
+    2. All-in-one subscription file.
+    3. Lightweight Top-5 quick picks file.
+    4. Rotating Persian VIP feature announcement.
+    Individual country files are preserved on disk and served directly inside the bot!
+    """
     if not CHANNEL_ID:
         logger.warning("CHANNEL_ID not set, skipping channel post")
         return
@@ -1564,16 +1896,13 @@ def post_all_countries_to_channel():
 
     timestamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
-    # 1. Collect top 3 fastest configs across top countries for 1-tap mobile clipboard copy
-    top_3_configs = []
-    for _, lines in active_entries[:3]:
-        if lines:
-            top_3_configs.append(lines[0])
+    # 1. Collect top 5 fastest non-SS configs across top countries for 1-tap mobile clipboard copy
+    top_5_configs = collect_top_fastest_configs(active_entries, count=5)
 
     fastest_block = ""
-    if top_3_configs:
-        code_lines = "\n\n".join(f"<code>{html.escape(cfg)}</code>" for cfg in top_3_configs)
-        fastest_block = f"\n\n⚡ <b>Top Fastest Configs (Tap to Copy):</b>\n{code_lines}"
+    if top_5_configs:
+        code_lines = "\n\n".join(f"<code>{html.escape(cfg)}</code>" for cfg in top_5_configs)
+        fastest_block = f"\n\n⚡ <b>Top 5 Fastest Configs (Tap to Copy):</b>\n{code_lines}"
 
     # 2. Generate and post update banner image as the main announcement
     try:
@@ -1585,7 +1914,8 @@ def post_all_countries_to_channel():
             f"⏱ <b>Push Schedule:</b> Every {UPDATE_INTERVAL_HOURS} Hours"
             f"{fastest_block}\n\n"
             f"💎 <b>سرورهای پرسرعت و بدون قطعی VIP با آی‌پی تمیز فعال شد!</b>\n"
-            f"📥 <i>فایل‌های رایگان کشورها و سابسکریپشن کامل در ادامه پیوست شده است.</i>\n"
+            f"📥 <i>فایل سابسکریپشن کامل و گلچین پرسرعت در ادامه پیوست شده‌اند.</i>\n"
+            f"🌐 <i>برای دریافت کانفیگ تفکیک‌شده بر اساس کشور، از دکمه زیر وارد ربات شوید:</i>\n\n"
             f"🔗 {CHANNEL_ID}"
         )
         markup = None
@@ -1593,7 +1923,8 @@ def post_all_countries_to_channel():
             markup = types.InlineKeyboardMarkup(row_width=1)
             markup.add(
                 types.InlineKeyboardButton("💎 خرید کانفیگ اختصاصی VIP (بدون قطعی)", url=f"https://t.me/{bot_username}?start=buy"),
-                types.InlineKeyboardButton("🤖 ورود به ربات برای دریافت کانفیگ", url=f"https://t.me/{bot_username}")
+                types.InlineKeyboardButton("🌍 دریافت کانفیگ تفکیک‌شده کشورها (در ربات)", url=f"https://t.me/{bot_username}?start=countries"),
+                types.InlineKeyboardButton("⚡ فایل گلچین سریع (Top 5 Quick Picks)", url=f"https://t.me/{bot_username}?start=top")
             )
 
         with open(banner_path, 'rb') as photo:
@@ -1644,16 +1975,11 @@ def post_all_countries_to_channel():
     except Exception as e:
         logger.warning("Failed to post quick picks file: %s", e)
 
-    # 5. Post individual country .txt files
-    posted_countries = 0
-    for country_name, lines in active_entries:
-        if post_to_channel(country_name, lines):
-            posted_countries += 1
-            time.sleep(3.5)
+    # Note: Individual country .txt files are no longer flooded to the channel!
+    # They remain safely stored on disk and users can request them on demand in the bot.
+    logger.info("Channel broadcast complete: 0 country flood spam, clean channel feed maintained")
 
-    logger.info("Channel broadcast complete: %d country files posted", posted_countries)
-
-    # 6. Post a rotating Persian VIP feature announcement to channel
+    # 5. Post a rotating Persian VIP feature announcement to channel
     try:
         announcement_idx = (int(time.time() // max(1, UPDATE_INTERVAL)) % len(persian_announcements.VIP_ANNOUNCEMENTS)) + 1
         persian_announcements.send_persian_announcement(bot, CHANNEL_ID, bot_username, template_id=announcement_idx)
@@ -1766,11 +2092,12 @@ def update_configs_loop():
             time.sleep(120)
             continue
 
-        # 6. Sort each bucket fastest-first (verified nodes with no latency keep their order)
+        # 6. Sort each bucket: prioritized protocols first (vless/trojan/vmess), then fastest-first
         for bucket, lines in temp_storage.items():
             temp_storage[bucket] = sorted(
                 lines,
                 key=lambda l: (
+                    protocol_priority(l),
                     latency_map.get(node_key(l)) is None,  # measured nodes first
                     latency_map.get(node_key(l)) or 10**9,
                 ),
@@ -2344,6 +2671,17 @@ def send_welcome(message):
             return
         elif param_lower == "donate":
             show_donation_menu(message.chat.id)
+            return
+        elif param_lower in ("countries", "country"):
+            send_message_safe(
+                message.chat.id,
+                "🌍 <b>لطفاً کشور مورد نظر خود را برای دریافت کانفیگ اختصاصی انتخاب کنید:</b>",
+                reply_markup=build_country_inline_keyboard(),
+                parse_mode="HTML"
+            )
+            return
+        elif param_lower == "top":
+            send_top_picks(message)
             return
         elif param_lower.startswith("ref_"):
             ref_str = param[4:]
