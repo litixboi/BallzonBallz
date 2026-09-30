@@ -2339,6 +2339,7 @@ def show_duration_menu(chat_id, devices: int, volume_gb: int, message_id=None):
     for p in matching_plans:
         days = p.get("duration_days", 30)
         dur_name = dur_labels.get(days, f"{days} روز")
+        toman = p.get("price_toman", 0)
         btn_title = f"▫️ {dur_name}: {toman:,} تومان"
         markup.add(types.InlineKeyboardButton(btn_title, callback_data=f"plan_sel:{p['id']}"))
 
