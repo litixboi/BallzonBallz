@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import httpx
 import qrcode
@@ -23,9 +23,10 @@ TRON_WALLET = (os.getenv("TRON_WALLET_ADDRESS") or DEFAULT_TRON_WALLET).strip()
 
 # Fallback prices if external rate APIs fail completely
 DEFAULT_RATES: Dict[str, float] = {
-    "TRX": 0.35,
+    "TRX": 0.34,
     "ETH": 2700.0,
     "USDT": 1.0,
+    "USDT_TOMAN": 252000.0,
 }
 
 _cache_lock = threading.Lock()
@@ -55,16 +56,137 @@ def get_cached_rates() -> Dict[str, float]:
         return dict(_rate_cache["rates"])
 
 
+def fetch_usdt_toman_rate() -> float:
+    """Fetch live USDT price in Iranian Toman (IRT) with multi-tier fallback:
+    1. Tetherland API (primary, lightweight JSON)
+    2. Wallex API
+    3. Bitpin API
+    4. USDT_TOMAN_RATE environment variable
+    5. DEFAULT_RATES['USDT_TOMAN'] fallback."""
+    # 1. Tetherland API
+    try:
+        r = _sync_session.get("https://api.tetherland.com/currencies", timeout=(3.0, 5.0))
+        if r.status_code == 200:
+            price = float(r.json().get("data", {}).get("currencies", {}).get("USDT", {}).get("price", 0))
+            if price > 1000:
+                logger.debug("Fetched USDT/Toman rate from Tetherland: %s", price)
+                return price
+    except Exception as e:
+        logger.debug("Tetherland rate fetch failed: %s - attempting Wallex", e)
+
+    # 2. Wallex API
+    try:
+        r = _sync_session.get("https://api.wallex.ir/v1/markets", timeout=(3.0, 5.0))
+        if r.status_code == 200:
+            price = float(r.json().get("result", {}).get("symbols", {}).get("USDTTMN", {}).get("stats", {}).get("lastPrice", 0))
+            if price > 1000:
+                logger.debug("Fetched USDT/Toman rate from Wallex: %s", price)
+                return price
+    except Exception as e:
+        logger.debug("Wallex rate fetch failed: %s - attempting Bitpin", e)
+
+    # 3. Bitpin API
+    try:
+        r = _sync_session.get("https://api.bitpin.ir/v1/mkt/markets/", timeout=(3.0, 5.0))
+        if r.status_code == 200:
+            for m in r.json().get("results", []):
+                if m.get("code") == "USDT_IRT":
+                    price = float(m.get("price", 0))
+                    if price > 1000:
+                        logger.debug("Fetched USDT/Toman rate from Bitpin: %s", price)
+                        return price
+    except Exception as e:
+        logger.debug("Bitpin rate fetch failed: %s - checking env", e)
+
+    # 4. Environment variable override
+    env_rate = os.getenv("USDT_TOMAN_RATE")
+    if env_rate:
+        try:
+            val = float(env_rate)
+            if val > 1000:
+                return val
+        except ValueError:
+            pass
+
+    return DEFAULT_RATES["USDT_TOMAN"]
+
+
+async def fetch_usdt_toman_rate_async(client: Optional[httpx.AsyncClient] = None) -> float:
+    """Async version of live USDT/Toman rate fetcher."""
+    # 1. Tetherland API
+    try:
+        if client:
+            r = await client.get("https://api.tetherland.com/currencies")
+        else:
+            async with httpx.AsyncClient(timeout=5.0, trust_env=False) as c:
+                r = await c.get("https://api.tetherland.com/currencies")
+        if r.status_code == 200:
+            price = float(r.json().get("data", {}).get("currencies", {}).get("USDT", {}).get("price", 0))
+            if price > 1000:
+                return price
+    except Exception as e:
+        logger.debug("Async Tetherland rate fetch failed: %s", e)
+
+    # 2. Wallex API
+    try:
+        if client:
+            r = await client.get("https://api.wallex.ir/v1/markets")
+        else:
+            async with httpx.AsyncClient(timeout=5.0, trust_env=False) as c:
+                r = await c.get("https://api.wallex.ir/v1/markets")
+        if r.status_code == 200:
+            price = float(r.json().get("result", {}).get("symbols", {}).get("USDTTMN", {}).get("stats", {}).get("lastPrice", 0))
+            if price > 1000:
+                return price
+    except Exception as e:
+        logger.debug("Async Wallex rate fetch failed: %s", e)
+
+    # 3. Bitpin API
+    try:
+        if client:
+            r = await client.get("https://api.bitpin.ir/v1/mkt/markets/")
+        else:
+            async with httpx.AsyncClient(timeout=5.0, trust_env=False) as c:
+                r = await c.get("https://api.bitpin.ir/v1/mkt/markets/")
+        if r.status_code == 200:
+            for m in r.json().get("results", []):
+                if m.get("code") == "USDT_IRT":
+                    price = float(m.get("price", 0))
+                    if price > 1000:
+                        return price
+    except Exception as e:
+        logger.debug("Async Bitpin rate fetch failed: %s", e)
+
+    # 4. Env override
+    env_rate = os.getenv("USDT_TOMAN_RATE")
+    if env_rate:
+        try:
+            val = float(env_rate)
+            if val > 1000:
+                return val
+        except ValueError:
+            pass
+
+    return DEFAULT_RATES["USDT_TOMAN"]
+
+
 def fetch_live_crypto_rates() -> Dict[str, float]:
     """Fetch live crypto exchange rates with connection pooling, retries, 90s TTL cache,
-    Binance primary and CoinGecko fallback."""
+    Binance primary, CoinGecko fallback, and multi-source USDT/Toman rate."""
     now = time.monotonic()
     with _cache_lock:
         if now - _rate_cache["last_fetch"] < _rate_cache["ttl"] and _rate_cache["rates"]:
             return dict(_rate_cache["rates"])
         rates = dict(_rate_cache["rates"])
 
-    # 1. Try Binance public API (timeouts: connect=5s, read=10s)
+    # 1. Fetch live USDT in Iranian Toman
+    try:
+        rates["USDT_TOMAN"] = fetch_usdt_toman_rate()
+    except Exception as e:
+        logger.warning("USDT/Toman rate fetch error: %s", e)
+        rates["USDT_TOMAN"] = rates.get("USDT_TOMAN", DEFAULT_RATES["USDT_TOMAN"])
+
+    # 2. Try Binance public API (timeouts: connect=5s, read=10s)
     try:
         r_trx = _sync_session.get("https://api.binance.com/api/v3/ticker/price?symbol=TRXUSDT", timeout=(5.0, 10.0))
         if r_trx.status_code == 200:
@@ -78,12 +200,15 @@ def fetch_live_crypto_rates() -> Dict[str, float]:
         with _cache_lock:
             _rate_cache["rates"] = rates
             _rate_cache["last_fetch"] = now
-        logger.info("Updated live rates from Binance: TRX=$%.4f, ETH=$%.2f", rates["TRX"], rates["ETH"])
+        logger.info(
+            "Updated live rates from Binance: TRX=$%.4f, ETH=$%.2f, USDT=%s IRT",
+            rates["TRX"], rates["ETH"], f"{rates['USDT_TOMAN']:,.0f}"
+        )
         return rates
     except Exception as e:
         logger.warning("Binance ticker fetch failed: %s - attempting CoinGecko fallback", e)
 
-    # 2. Fallback to CoinGecko
+    # 3. Fallback to CoinGecko
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum,tron,tether&vs_currencies=usd"
         r_cg = _sync_session.get(url, timeout=(5.0, 10.0))
@@ -95,11 +220,17 @@ def fetch_live_crypto_rates() -> Dict[str, float]:
             with _cache_lock:
                 _rate_cache["rates"] = rates
                 _rate_cache["last_fetch"] = now
-            logger.info("Updated live rates from CoinGecko: TRX=$%.4f, ETH=$%.2f", rates["TRX"], rates["ETH"])
+            logger.info(
+                "Updated live rates from CoinGecko: TRX=$%.4f, ETH=$%.2f, USDT=%s IRT",
+                rates["TRX"], rates["ETH"], f"{rates['USDT_TOMAN']:,.0f}"
+            )
             return rates
     except Exception as e:
         logger.warning("CoinGecko rate fetch failed: %s - using cached rates", e)
 
+    with _cache_lock:
+        _rate_cache["rates"] = rates
+        _rate_cache["last_fetch"] = now
     return rates
 
 
@@ -113,7 +244,14 @@ async def fetch_live_crypto_rates_async() -> Dict[str, float]:
 
     timeout = httpx.Timeout(10.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-        # 1. Try Binance
+        # 1. Live USDT/Toman
+        try:
+            rates["USDT_TOMAN"] = await fetch_usdt_toman_rate_async(client)
+        except Exception as e:
+            logger.warning("Async USDT/Toman rate fetch error: %s", e)
+            rates["USDT_TOMAN"] = rates.get("USDT_TOMAN", DEFAULT_RATES["USDT_TOMAN"])
+
+        # 2. Try Binance
         try:
             r_trx = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=TRXUSDT")
             if r_trx.status_code == 200:
@@ -127,12 +265,15 @@ async def fetch_live_crypto_rates_async() -> Dict[str, float]:
             with _cache_lock:
                 _rate_cache["rates"] = rates
                 _rate_cache["last_fetch"] = now
-            logger.info("Async updated live rates from Binance: TRX=$%.4f, ETH=$%.2f", rates["TRX"], rates["ETH"])
+            logger.info(
+                "Async updated live rates from Binance: TRX=$%.4f, ETH=$%.2f, USDT=%s IRT",
+                rates["TRX"], rates["ETH"], f"{rates['USDT_TOMAN']:,.0f}"
+            )
             return rates
         except Exception as e:
             logger.warning("Async Binance ticker fetch failed: %s - trying CoinGecko fallback", e)
 
-        # 2. Try CoinGecko
+        # 3. Try CoinGecko
         try:
             url = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum,tron,tether&vs_currencies=usd"
             r_cg = await client.get(url)
@@ -144,30 +285,73 @@ async def fetch_live_crypto_rates_async() -> Dict[str, float]:
                 with _cache_lock:
                     _rate_cache["rates"] = rates
                     _rate_cache["last_fetch"] = now
-                logger.info("Async updated live rates from CoinGecko: TRX=$%.4f, ETH=$%.2f", rates["TRX"], rates["ETH"])
+                logger.info(
+                    "Async updated live rates from CoinGecko: TRX=$%.4f, ETH=$%.2f, USDT=%s IRT",
+                    rates["TRX"], rates["ETH"], f"{rates['USDT_TOMAN']:,.0f}"
+                )
                 return rates
         except Exception as e:
             logger.warning("Async CoinGecko rate fetch failed: %s - using cached rates", e)
 
+    with _cache_lock:
+        _rate_cache["rates"] = rates
+        _rate_cache["last_fetch"] = now
     return rates
 
 
-def calculate_adaptive_prices(price_usd: float) -> Dict[str, Any]:
-    """Calculates adaptive payment amounts across supported cryptos based on live rates."""
+def calculate_adaptive_prices(price_usd: float = 0.0, price_toman: Optional[int] = None) -> Dict[str, Any]:
+    """Calculates adaptive payment amounts across supported cryptos based on live market rates.
+    If price_toman is provided, converts dynamically into USDT based on the latest live
+    USDT/Toman exchange rate, then into TRX and ETH.
+    Also calculates blockchain network and exchange withdrawal fees for full transparency."""
     rates = fetch_live_crypto_rates()
-    trx_rate = max(0.001, rates.get("TRX", DEFAULT_RATES["TRX"]))
-    eth_rate = max(1.0, rates.get("ETH", DEFAULT_RATES["ETH"]))
+    trx_rate = max(0.001, float(rates.get("TRX", DEFAULT_RATES["TRX"])))
+    eth_rate = max(1.0, float(rates.get("ETH", DEFAULT_RATES["ETH"])))
+    usdt_toman_rate = max(1000.0, float(rates.get("USDT_TOMAN", DEFAULT_RATES["USDT_TOMAN"])))
 
-    trx_amount = round(price_usd / trx_rate, 2)
-    eth_amount = round(price_usd / eth_rate, 6)
-    usdt_amount = round(price_usd, 2)
+    if price_toman is not None and price_toman > 0:
+        effective_toman = int(price_toman)
+        usdt_amount = max(0.1, round(effective_toman / usdt_toman_rate, 2))
+        effective_usd = usdt_amount
+    else:
+        effective_usd = round(price_usd, 2)
+        usdt_amount = effective_usd
+        effective_toman = int(round(effective_usd * usdt_toman_rate))
+
+    trx_amount = round(usdt_amount / trx_rate, 2)
+    eth_amount = round(usdt_amount / eth_rate, 6)
+
+    # Calculate estimated network / exchange withdrawal fees
+    # TRX: typical exchange fee is 1 TRX (~$0.34)
+    # USDT-TRC20: typical exchange fee is 1.0 - 1.5 USDT
+    # ETH: typical exchange fee is ~0.001 ETH
+    trx_fee = 1.0
+    usdt_fee = 1.0
+    eth_fee = 0.001
+
+    trx_recommended_gross = round(trx_amount + trx_fee, 2)
+    usdt_recommended_gross = round(usdt_amount + usdt_fee, 2)
+    eth_recommended_gross = round(eth_amount + eth_fee, 6)
 
     return {
-        "price_usd": price_usd,
+        "price_usd": effective_usd,
+        "price_toman": effective_toman,
         "usdt": usdt_amount,
         "trx": trx_amount,
         "eth": eth_amount,
         "rates": rates,
+        "usdt_toman_rate": int(usdt_toman_rate),
+        "trx_usd_rate": trx_rate,
+        "eth_usd_rate": eth_rate,
+        "fees": {
+            "trx_fee": trx_fee,
+            "trx_fee_usd": round(trx_fee * trx_rate, 2),
+            "trx_gross": trx_recommended_gross,
+            "usdt_fee": usdt_fee,
+            "usdt_gross": usdt_recommended_gross,
+            "eth_fee": eth_fee,
+            "eth_gross": eth_recommended_gross,
+        },
     }
 
 

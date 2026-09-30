@@ -2761,7 +2761,7 @@ def run_admin_health_check() -> str:
 
     # 5. Live Crypto Rates Cache
     rates = crypto_manager.get_cached_rates()
-    lines.append(f"💰 <b>نرخ‌های کش شده:</b> TRX: ${rates.get('TRX', 0):.4f} | ETH: ${rates.get('ETH', 0):.2f} (TTL: 90s)")
+    lines.append(f"💰 <b>نرخ‌های کش شده:</b> USDT: {rates.get('USDT_TOMAN', 0):,.0f} IRT | TRX: ${rates.get('TRX', 0):.4f} | ETH: ${rates.get('ETH', 0):.2f} (TTL: 90s)")
 
     # 6. Subscription Mirrors
     lines.append("\n🌐 <b>وضعیت میرورهای سابسکریپشن:</b>")
@@ -3262,7 +3262,7 @@ def handle_plan_selection(call):
     final_toman = disc["final_toman"]
     final_usd = disc["final_usd"]
     discount_pct = disc["discount_pct"]
-    calc = crypto_manager.calculate_adaptive_prices(final_usd)
+    calc = crypto_manager.calculate_adaptive_prices(price_usd=final_usd, price_toman=final_toman)
 
     devices = plan.get("devices", 1)
     volume_gb = plan.get("volume_gb", 30)
@@ -3283,16 +3283,27 @@ def handle_plan_selection(call):
             f"<i>💡 امکان دریافت تا سقف ۳۰٪ تخفیف در منوی /club!</i>\n\n"
         )
 
+    usdt_toman = calc.get("usdt_toman_rate", 252000)
+    trx_rate = calc.get("trx_usd_rate", 0.34)
+    trx_in_toman = int(trx_rate * usdt_toman)
+
     text = (
-        f"💎 <b>جزئیات پلن و انتخاب تعداد / روش پرداخت:</b>\n\n"
+        f"💎 <b>جزئیات پلن و انتخاب روش پرداخت:</b>\n\n"
         f"▫️ <b>پلن انتخابی:</b> {volume_gb} گیگابایت | {dur_str} ({devices} کاربره)\n"
         f"▫️ <b>تعداد اشتراک انتخابی:</b> <b>{qty} عدد</b>\n"
         f"{cost_block}"
         f"💰 <b>مبلغ قابل پرداخت با رمزارز (نرخ لحظه‌ای بازار):</b>\n"
-        f"💵 <b>معادل تتر (USDT):</b> ${calc['usdt']:.2f} USDT\n"
-        f"🔺 <b>معادل ترون (TRX):</b> ~{calc['trx']} TRX\n"
-        f"🔹 <b>معادل اتریوم (ETH):</b> ~{calc['eth']} ETH\n\n"
-        f"👇 <i>می‌توانید تعداد اشتراک را تغییر دهید یا شبکه پرداخت را انتخاب فرمایید:</i>"
+        f"🔺 <b>ترون (TRX):</b> <b>~{calc['trx']} TRX</b> <i>(پیشنهادی ⚡️ کمترین کارمزد)</i>\n"
+        f"💵 <b>تتر (USDT-TRC20):</b> <b>${calc['usdt']:.2f} USDT</b>\n"
+        f"🔹 <b>اتریوم (ETH):</b> ~{calc['eth']} ETH\n\n"
+        f"📊 <b>نرخ‌های لحظه‌ای بازار:</b>\n"
+        f"• ۱ تتر (USDT) = {usdt_toman:,} تومان\n"
+        f"• ۱ ترون (TRX) = ${trx_rate:.4f} تتر (~{trx_in_toman:,} تومان)\n\n"
+        f"⛽️ <b>بررسی و مقایسه کارمزد انتقال (Fees):</b>\n"
+        f"▫️ <b>کارمزد انتقال ترون (TRX):</b> فقط <b>~۱ ترون</b> (~۰.۳۴ دلار) است و برای پرداخت‌های خرد کاملاً به‌صرفه است.\n"
+        f"▫️ <b>کارمزد انتقال تتر (USDT):</b> صرافی‌ها معمولاً <b>۱.۰ الی ۱.۵ تتر</b> کارمزد برداشت کسر می‌کنند.\n"
+        f"<i>💡 جهت پرداخت کمترین کارمزد، انتخاب <b>ترون (TRX)</b> به شدت توصیه می‌شود.</i>\n\n"
+        f"👇 <i>می‌توانید تعداد اشتراک را تغییر دهید یا ارز مورد نظر را جهت پرداخت انتخاب کنید:</i>"
     )
 
     markup = types.InlineKeyboardMarkup(row_width=4)
@@ -3303,8 +3314,9 @@ def handle_plan_selection(call):
     markup.row(*qty_buttons)
 
     markup.add(
-        types.InlineKeyboardButton("🔺 پرداخت در شبکه ترون (TRX / USDT-TRC20)", callback_data=f"pay_net:{plan_id}:tron:{qty}"),
-        types.InlineKeyboardButton("🔹 پرداخت در شبکه اتریوم (ETH / USDT-ERC20)", callback_data=f"pay_net:{plan_id}:eth:{qty}"),
+        types.InlineKeyboardButton("🔺 پرداخت با ترون (TRX - کمترین کارمزد) ⚡️", callback_data=f"pay_net:{plan_id}:trx:{qty}"),
+        types.InlineKeyboardButton("💵 پرداخت با تتر (USDT-TRC20)", callback_data=f"pay_net:{plan_id}:usdt_trc20:{qty}"),
+        types.InlineKeyboardButton("🔹 پرداخت با اتریوم (ETH / ERC20)", callback_data=f"pay_net:{plan_id}:eth:{qty}"),
         types.InlineKeyboardButton("🔙 بازگشت به انتخاب مدت زمان", callback_data=f"buy_vol:{devices}:{volume_gb}")
     )
     try:
@@ -3342,20 +3354,48 @@ def handle_payment_network(call):
     final_toman = disc["final_toman"]
     final_usd = disc["final_usd"]
     discount_pct = disc["discount_pct"]
-    calc = crypto_manager.calculate_adaptive_prices(final_usd)
+    calc = crypto_manager.calculate_adaptive_prices(price_usd=final_usd, price_toman=final_toman)
 
-    if network == "tron":
+    fees = calc.get("fees", {})
+    if network in ("trx", "tron"):
         wallet_address = crypto_manager.TRON_WALLET
         net_title = "شبکه ترون (Tron Network - TRC20)"
-        crypto_curr = "TRX / USDT-TRC20"
-        amount_str = f"<b>{calc['trx']} TRX</b> یا <b>${calc['usdt']:.2f} USDT-TRC20</b>"
+        crypto_curr = "TRX"
         crypto_amount = calc['trx']
-    else:
+        amount_str = f"<b>{calc['trx']} TRX</b> (~${calc['usdt']:.2f} USDT)"
+        trx_gross = fees.get("trx_gross", round(calc['trx'] + 1.0, 2))
+        fee_info = (
+            "⛽️ <b>بررسی کارمزد انتقال (Network & Exchange Fee):</b>\n"
+            "▫️ کارمزد انتقال از کیف پول شخصی (تراست‌ولت و...): ~۱.۱ TRX\n"
+            "▫️ کارمزد برداشت از صرافی‌ها (نوبیتکس، والکس، کوینکس و...): معمولاً ۱ TRX (~۰.۳۴ دلار)\n\n"
+            "💡 <b>نکته مهم هنگام انتقال از صرافی:</b>\n"
+            f"اگر از صرافی ایرانی یا خارجی واریز می‌کنید، صرافی ۱ ترون کارمزد کسر می‌کند. "
+            f"برای اینکه دقیقاً <b>{calc['trx']} TRX</b> به کیف پول مقصد برسد، در کادر برداشت صرافی مبلغ <b>{trx_gross:.2f} TRX</b> را وارد فرمایید."
+        )
+    elif network == "usdt_trc20":
+        wallet_address = crypto_manager.TRON_WALLET
+        net_title = "شبکه ترون (Tron Network - USDT-TRC20)"
+        crypto_curr = "USDT-TRC20"
+        crypto_amount = calc['usdt']
+        amount_str = f"<b>${calc['usdt']:.2f} USDT</b> (معادل ~{calc['trx']} TRX)"
+        usdt_gross = fees.get("usdt_gross", round(calc['usdt'] + 1.0, 2))
+        fee_info = (
+            "⛽️ <b>بررسی کارمزد انتقال (Exchange Withdrawal Fee):</b>\n"
+            "▫️ کارمزد برداشت تتر در صرافی‌های ایرانی و خارجی معمولاً <b>۱.۰ الی ۱.۵ تتر</b> است.\n\n"
+            "⚠️ <b>هشدار بسیار مهم کسر کارمزد در صرافی:</b>\n"
+            f"هنگام ثبت برداشت تتر در صرافی، حتماً گزینه <b>«دریافتی نهایی» (Receive Amount)</b> را بررسی فرمایید تا دقیقاً برابر با <b>${calc['usdt']:.2f} USDT</b> باشد. "
+            f"اگر کارمزد از مبلغ کسر شود، وجه دریافتی ناقص خواهد بود (مبلغ پیشنهادی جهت ثبت در کادر برداشت صرافی: <b>${usdt_gross:.2f} USDT</b>)."
+        )
+    else:  # eth
         wallet_address = crypto_manager.ETH_WALLET
         net_title = "شبکه اتریوم (Ethereum Network - ERC20)"
-        crypto_curr = "ETH / USDT-ERC20"
-        amount_str = f"<b>{calc['eth']} ETH</b> یا <b>${calc['usdt']:.2f} USDT-ERC20</b>"
+        crypto_curr = "ETH"
         crypto_amount = calc['eth']
+        amount_str = f"<b>{calc['eth']} ETH</b> یا <b>${calc['usdt']:.2f} USDT-ERC20</b>"
+        fee_info = (
+            "⛽️ <b>بررسی کارمزد انتقال (Ethereum Gas Fee):</b>\n"
+            "▫️ به دلیل بالا بودن کارمزد گس شبکه اتریوم، لطفاً دقت فرمایید که مبلغ دریافتی نهایی دقیقاً معادل فاکتور باشد."
+        )
 
     # Create order in order_manager with quantity and club discount
     order_id = order_mgr.create_order(
@@ -3394,12 +3434,13 @@ def handle_payment_network(call):
         f"{qty_line}"
         f"{price_line}"
         f"🌐 <b>شبکه انتقال:</b> {net_title}\n"
-        f"💰 <b>مبلغ قابل واریز:</b> {amount_str}\n\n"
+        f"💰 <b>مبلغ خالص دریافتی فاکتور:</b> {amount_str}\n\n"
+        f"{fee_info}\n\n"
         f"📍 <b>آدرس کیف پول جهت واریز:</b>\n"
         f"<code>{wallet_address}</code>\n"
         f"<i>(روی آدرس ضربه بزنید تا کپی شود)</i>\n\n"
         f"⚠️ <b>راهنمای تکمیل خرید:</b>\n"
-        f"۱. مبلغ مشخص‌شده را به آدرس بالا انتقال دهید.\n"
+        f"۱. مبلغ مشخص‌شده را با در نظر گرفتن کارمزد به آدرس بالا انتقال دهید.\n"
         f"۲. پس از انجام انتقال، دکمه <b>«ثبت رسید / شناسه تراکنش (TxID)»</b> را بزنید و کد هش (TxID) یا عکس رسید را ارسال نمایید.\n"
         f"۳. پس از تایید مدیریت، اشتراک اختصاصی شما به صورت خودکار صادر خواهد شد."
     )
