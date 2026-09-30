@@ -32,18 +32,26 @@ class TestLiveCryptoConversionAndFees(unittest.TestCase):
             "USDT_TOMAN": 252750.0,
         }
         with patch.object(crypto_manager, "fetch_live_crypto_rates", return_value=mock_rates):
-            # 260,000 Tomans
-            pricing = crypto_manager.calculate_adaptive_prices(price_usd=2.6, price_toman=260000)
-            self.assertEqual(pricing["price_toman"], 260000)
-            # 260,000 / 252,750 = ~1.03 USDT
-            self.assertAlmostEqual(pricing["usdt"], 1.03, places=2)
-            # 1.03 / 0.3379 = ~3.05 TRX
-            self.assertAlmostEqual(pricing["trx"], 3.05, places=2)
-            # Fees
+            # Test 400,000 Tomans plan
+            pricing = crypto_manager.calculate_adaptive_prices(price_usd=4.0, price_toman=400000)
+            self.assertEqual(pricing["price_toman"], 400000)
+            # 400,000 / 252,750 = ~1.58 USDT (NOT $4.0 USD!)
+            self.assertAlmostEqual(pricing["usdt"], 1.58, places=2)
+            # 1.58 / 0.3379 = ~4.68 TRX
+            self.assertAlmostEqual(pricing["trx"], 4.68, places=2)
+            # 4 payment option gross amounts with fees included:
+            # 1. TRX: 4.68 + 1.0 = 5.68 TRX
             self.assertEqual(pricing["fees"]["trx_fee"], 1.0)
-            self.assertAlmostEqual(pricing["fees"]["trx_gross"], 4.05, places=2)
+            self.assertAlmostEqual(pricing["fees"]["trx_gross"], 5.68, places=2)
+            # 2. USDT-TRC20: 1.58 + 1.0 = 2.58 USDT
             self.assertEqual(pricing["fees"]["usdt_fee"], 1.0)
-            self.assertAlmostEqual(pricing["fees"]["usdt_gross"], 2.03, places=2)
+            self.assertAlmostEqual(pricing["fees"]["usdt_gross"], 2.58, places=2)
+            # 3. ETH: (1.58 / 2700) + 0.001 = ~0.001585 ETH
+            self.assertEqual(pricing["fees"]["eth_fee"], 0.001)
+            self.assertGreater(pricing["fees"]["eth_gross"], 0.001)
+            # 4. USDT-ERC20: 1.58 + 2.0 = 3.58 USDT
+            self.assertEqual(pricing["fees"]["usdt_erc20_fee"], 2.0)
+            self.assertAlmostEqual(pricing["fees"]["usdt_erc20_gross"], 3.58, places=2)
 
     def test_multi_tier_fallback(self):
         # When all external network calls fail, should fallback to env or default

@@ -2339,9 +2339,7 @@ def show_duration_menu(chat_id, devices: int, volume_gb: int, message_id=None):
     for p in matching_plans:
         days = p.get("duration_days", 30)
         dur_name = dur_labels.get(days, f"{days} روز")
-        toman = p.get("price_toman", 0)
-        usd = p.get("price_usd", 0.0)
-        btn_title = f"▫️ {dur_name}: {toman:,} تومان (~${usd:.0f} USD)"
+        btn_title = f"▫️ {dur_name}: {toman:,} تومان"
         markup.add(types.InlineKeyboardButton(btn_title, callback_data=f"plan_sel:{p['id']}"))
 
     markup.add(types.InlineKeyboardButton("🔙 بازگشت به انتخاب حجم", callback_data=f"buy_cat:{devices}"))
@@ -2536,7 +2534,7 @@ def handle_view_order(call):
             f"⏳ <b>سفارش در انتظار پرداخت <code>{html.escape(order_id)}</code></b>\n\n"
             f"📦 <b>پلن:</b> {html.escape(str(order.get('plan_name', 'VIP')))}\n"
             f"🔢 <b>تعداد:</b> {qty} عدد\n"
-            f"💵 <b>مبلغ کل:</b> {order.get('price_toman', 0):,} تومان (~${order.get('price_usd', 0):.1f} USD)\n"
+            f"💵 <b>مبلغ کل:</b> {order.get('price_toman', 0):,} تومان\n"
             f"🌐 <b>شبکه انتقال:</b> {html.escape(str(order.get('crypto_network', '')))}\n\n"
             f"لطفاً پس از واریز رمزارز، روی دکمه <b>«ثبت رسید / کد رهگیری»</b> کلیک فرمایید تا سفارش شما بررسی و فعال شود."
         )
@@ -3275,35 +3273,25 @@ def handle_plan_selection(call):
         cost_block = (
             f"▫️ <b>مبلغ پایه:</b> {total_toman:,} تومان{qty_note}\n"
             f"🎁 <b>تخفیف باشگاه مشتریان ({discount_pct}٪):</b> <b>{disc['discount_toman']:,}- تومان</b>\n"
-            f"✅ <b>مبلغ نهایی قابل پرداخت:</b> <b>{final_toman:,} تومان</b>\n\n"
+            f"✅ <b>مبلغ نهایی:</b> <b>{final_toman:,} تومان</b>\n\n"
         )
     else:
         cost_block = (
-            f"▫️ <b>مجموع مبلغ تومانی:</b> <b>{total_toman:,} تومان</b>{qty_note}\n"
-            f"<i>💡 امکان دریافت تا سقف ۳۰٪ تخفیف در منوی /club!</i>\n\n"
+            f"▫️ <b>مبلغ کل:</b> <b>{total_toman:,} تومان</b>{qty_note}\n\n"
         )
 
-    usdt_toman = calc.get("usdt_toman_rate", 252000)
-    trx_rate = calc.get("trx_usd_rate", 0.34)
-    trx_in_toman = int(trx_rate * usdt_toman)
-
+    fees = calc.get("fees", {})
     text = (
         f"💎 <b>جزئیات پلن و انتخاب روش پرداخت:</b>\n\n"
         f"▫️ <b>پلن انتخابی:</b> {volume_gb} گیگابایت | {dur_str} ({devices} کاربره)\n"
-        f"▫️ <b>تعداد اشتراک انتخابی:</b> <b>{qty} عدد</b>\n"
+        f"▫️ <b>تعداد:</b> <b>{qty} عدد</b>\n"
         f"{cost_block}"
-        f"💰 <b>مبلغ قابل پرداخت با رمزارز (نرخ لحظه‌ای بازار):</b>\n"
-        f"🔺 <b>ترون (TRX):</b> <b>~{calc['trx']} TRX</b> <i>(پیشنهادی ⚡️ کمترین کارمزد)</i>\n"
-        f"💵 <b>تتر (USDT-TRC20):</b> <b>${calc['usdt']:.2f} USDT</b>\n"
-        f"🔹 <b>اتریوم (ETH):</b> ~{calc['eth']} ETH\n\n"
-        f"📊 <b>نرخ‌های لحظه‌ای بازار:</b>\n"
-        f"• ۱ تتر (USDT) = {usdt_toman:,} تومان\n"
-        f"• ۱ ترون (TRX) = ${trx_rate:.4f} تتر (~{trx_in_toman:,} تومان)\n\n"
-        f"⛽️ <b>بررسی و مقایسه کارمزد انتقال (Fees):</b>\n"
-        f"▫️ <b>کارمزد انتقال ترون (TRX):</b> فقط <b>~۱ ترون</b> (~۰.۳۴ دلار) است و برای پرداخت‌های خرد کاملاً به‌صرفه است.\n"
-        f"▫️ <b>کارمزد انتقال تتر (USDT):</b> صرافی‌ها معمولاً <b>۱.۰ الی ۱.۵ تتر</b> کارمزد برداشت کسر می‌کنند.\n"
-        f"<i>💡 جهت پرداخت کمترین کارمزد، انتخاب <b>ترون (TRX)</b> به شدت توصیه می‌شود.</i>\n\n"
-        f"👇 <i>می‌توانید تعداد اشتراک را تغییر دهید یا ارز مورد نظر را جهت پرداخت انتخاب کنید:</i>"
+        f"💳 <b>مبلغ نهایی قابل پرداخت (با احتساب کارمزد انتقال):</b>\n"
+        f"🔺 <b>ترون (TRX):</b> <code>{fees.get('trx_gross', calc['trx'])} TRX</code> <i>(پیشنهادی ⚡️ کمترین کارمزد)</i>\n"
+        f"💵 <b>تتر ترون (USDT-TRC20):</b> <code>{fees.get('usdt_gross', calc['usdt']):.2f} USDT</code>\n"
+        f"🔹 <b>اتریوم (ETH):</b> <code>{fees.get('eth_gross', calc['eth'])} ETH</code>\n"
+        f"💵 <b>تتر اتریوم (USDT-ERC20):</b> <code>{fees.get('usdt_erc20_gross', calc['usdt']):.2f} USDT</code>\n\n"
+        f"👇 <i>روش پرداخت مورد نظر را جهت دریافت آدرس کیف پول انتخاب فرمایید:</i>"
     )
 
     markup = types.InlineKeyboardMarkup(row_width=4)
@@ -3314,9 +3302,10 @@ def handle_plan_selection(call):
     markup.row(*qty_buttons)
 
     markup.add(
-        types.InlineKeyboardButton("🔺 پرداخت با ترون (TRX - کمترین کارمزد) ⚡️", callback_data=f"pay_net:{plan_id}:trx:{qty}"),
-        types.InlineKeyboardButton("💵 پرداخت با تتر (USDT-TRC20)", callback_data=f"pay_net:{plan_id}:usdt_trc20:{qty}"),
-        types.InlineKeyboardButton("🔹 پرداخت با اتریوم (ETH / ERC20)", callback_data=f"pay_net:{plan_id}:eth:{qty}"),
+        types.InlineKeyboardButton("🔺 ۱. ترون (TRX) - شبکه Tron ⚡️ (کمترین کارمزد)", callback_data=f"pay_net:{plan_id}:trx:{qty}"),
+        types.InlineKeyboardButton("💵 ۲. تتر (USDT) - شبکه ترون TRC-20", callback_data=f"pay_net:{plan_id}:usdt_trc20:{qty}"),
+        types.InlineKeyboardButton("🔹 ۳. اتریوم (ETH) - شبکه Ethereum", callback_data=f"pay_net:{plan_id}:eth:{qty}"),
+        types.InlineKeyboardButton("💵 ۴. تتر (USDT) - شبکه اتریوم ERC-20", callback_data=f"pay_net:{plan_id}:usdt_erc20:{qty}"),
         types.InlineKeyboardButton("🔙 بازگشت به انتخاب مدت زمان", callback_data=f"buy_vol:{devices}:{volume_gb}")
     )
     try:
@@ -3357,47 +3346,32 @@ def handle_payment_network(call):
     calc = crypto_manager.calculate_adaptive_prices(price_usd=final_usd, price_toman=final_toman)
 
     fees = calc.get("fees", {})
-    if network in ("trx", "tron"):
+    if network == "trx":
         wallet_address = crypto_manager.TRON_WALLET
-        net_title = "شبکه ترون (Tron Network - TRC20)"
+        net_title = "شبکه ترون (Tron Network - TRX)"
         crypto_curr = "TRX"
-        crypto_amount = calc['trx']
-        amount_str = f"<b>{calc['trx']} TRX</b> (~${calc['usdt']:.2f} USDT)"
-        trx_gross = fees.get("trx_gross", round(calc['trx'] + 1.0, 2))
-        fee_info = (
-            "⛽️ <b>بررسی کارمزد انتقال (Network & Exchange Fee):</b>\n"
-            "▫️ کارمزد انتقال از کیف پول شخصی (تراست‌ولت و...): ~۱.۱ TRX\n"
-            "▫️ کارمزد برداشت از صرافی‌ها (نوبیتکس، والکس، کوینکس و...): معمولاً ۱ TRX (~۰.۳۴ دلار)\n\n"
-            "💡 <b>نکته مهم هنگام انتقال از صرافی:</b>\n"
-            f"اگر از صرافی ایرانی یا خارجی واریز می‌کنید، صرافی ۱ ترون کارمزد کسر می‌کند. "
-            f"برای اینکه دقیقاً <b>{calc['trx']} TRX</b> به کیف پول مقصد برسد، در کادر برداشت صرافی مبلغ <b>{trx_gross:.2f} TRX</b> را وارد فرمایید."
-        )
-    elif network == "usdt_trc20":
+        crypto_amount = fees.get("trx_gross", round(calc['trx'] + 1.0, 2))
+        amount_display = f"<code>{crypto_amount} TRX</code>"
+    elif network in ("usdt_trc20", "tron"):
         wallet_address = crypto_manager.TRON_WALLET
-        net_title = "شبکه ترون (Tron Network - USDT-TRC20)"
+        net_title = "شبکه ترون (Tron - USDT-TRC20)"
         crypto_curr = "USDT-TRC20"
-        crypto_amount = calc['usdt']
-        amount_str = f"<b>${calc['usdt']:.2f} USDT</b> (معادل ~{calc['trx']} TRX)"
-        usdt_gross = fees.get("usdt_gross", round(calc['usdt'] + 1.0, 2))
-        fee_info = (
-            "⛽️ <b>بررسی کارمزد انتقال (Exchange Withdrawal Fee):</b>\n"
-            "▫️ کارمزد برداشت تتر در صرافی‌های ایرانی و خارجی معمولاً <b>۱.۰ الی ۱.۵ تتر</b> است.\n\n"
-            "⚠️ <b>هشدار بسیار مهم کسر کارمزد در صرافی:</b>\n"
-            f"هنگام ثبت برداشت تتر در صرافی، حتماً گزینه <b>«دریافتی نهایی» (Receive Amount)</b> را بررسی فرمایید تا دقیقاً برابر با <b>${calc['usdt']:.2f} USDT</b> باشد. "
-            f"اگر کارمزد از مبلغ کسر شود، وجه دریافتی ناقص خواهد بود (مبلغ پیشنهادی جهت ثبت در کادر برداشت صرافی: <b>${usdt_gross:.2f} USDT</b>)."
-        )
-    else:  # eth
+        crypto_amount = fees.get("usdt_gross", round(calc['usdt'] + 1.0, 2))
+        amount_display = f"<code>{crypto_amount:.2f} USDT</code>"
+    elif network == "eth":
         wallet_address = crypto_manager.ETH_WALLET
-        net_title = "شبکه اتریوم (Ethereum Network - ERC20)"
+        net_title = "شبکه اتریوم (Ethereum - ETH)"
         crypto_curr = "ETH"
-        crypto_amount = calc['eth']
-        amount_str = f"<b>{calc['eth']} ETH</b> یا <b>${calc['usdt']:.2f} USDT-ERC20</b>"
-        fee_info = (
-            "⛽️ <b>بررسی کارمزد انتقال (Ethereum Gas Fee):</b>\n"
-            "▫️ به دلیل بالا بودن کارمزد گس شبکه اتریوم، لطفاً دقت فرمایید که مبلغ دریافتی نهایی دقیقاً معادل فاکتور باشد."
-        )
+        crypto_amount = fees.get("eth_gross", round(calc['eth'] + 0.001, 6))
+        amount_display = f"<code>{crypto_amount} ETH</code>"
+    else:  # usdt_erc20
+        wallet_address = crypto_manager.ETH_WALLET
+        net_title = "شبکه اتریوم (Ethereum - USDT-ERC20)"
+        crypto_curr = "USDT-ERC20"
+        crypto_amount = fees.get("usdt_erc20_gross", round(calc['usdt'] + 2.0, 2))
+        amount_display = f"<code>{crypto_amount:.2f} USDT</code>"
 
-    # Create order in order_manager with quantity and club discount
+    # Create order in order_manager with quantity, club discount, and true live USD
     order_id = order_mgr.create_order(
         user_id=call.from_user.id,
         username=call.from_user.username,
@@ -3410,7 +3384,7 @@ def handle_payment_network(call):
         discount_percent=discount_pct,
         discount_toman=disc["discount_toman"],
         final_price_toman=final_toman,
-        final_price_usd=final_usd,
+        final_price_usd=calc['usdt'],
     )
 
     dur_days = plan.get("duration_days", 30)
@@ -3422,10 +3396,10 @@ def handle_payment_network(call):
         price_line = (
             f"▫️ <b>مبلغ پایه:</b> {total_toman:,} تومان\n"
             f"🎁 <b>تخفیف باشگاه مشتریان ({discount_pct}٪):</b> {disc['discount_toman']:,}- تومان\n"
-            f"💵 <b>مبلغ نهایی سفارش:</b> <b>{final_toman:,} تومان</b> (~${final_usd:.2f} USD)\n"
+            f"💵 <b>مبلغ نهایی پلن:</b> <b>{final_toman:,} تومان</b>\n"
         )
     else:
-        price_line = f"💵 <b>مبلغ کل سفارش:</b> <b>{total_toman:,} تومان</b> (~${total_usd:.1f} USD)\n"
+        price_line = f"💵 <b>مبلغ پلن:</b> <b>{total_toman:,} تومان</b>\n"
 
     qr_bytes = crypto_manager.generate_qr_bytes(wallet_address)
     caption = (
@@ -3433,16 +3407,17 @@ def handle_payment_network(call):
         f"📦 <b>پلن:</b> {plan.get('volume_gb', 30)} گیگ | {dur_str} ({plan.get('devices', 1)} کاربره)\n"
         f"{qty_line}"
         f"{price_line}"
-        f"🌐 <b>شبکه انتقال:</b> {net_title}\n"
-        f"💰 <b>مبلغ خالص دریافتی فاکتور:</b> {amount_str}\n\n"
-        f"{fee_info}\n\n"
+        f"🌐 <b>شبکه انتقال:</b> {net_title}\n\n"
+        f"💰 <b>مبلغ نهایی قابل واریز (با احتساب کارمزد):</b>\n"
+        f"{amount_display}\n"
+        f"<i>(روی عدد ضربه بزنید تا کپی شود)</i>\n\n"
         f"📍 <b>آدرس کیف پول جهت واریز:</b>\n"
         f"<code>{wallet_address}</code>\n"
         f"<i>(روی آدرس ضربه بزنید تا کپی شود)</i>\n\n"
-        f"⚠️ <b>راهنمای تکمیل خرید:</b>\n"
-        f"۱. مبلغ مشخص‌شده را با در نظر گرفتن کارمزد به آدرس بالا انتقال دهید.\n"
+        f"⚠️ <b>راهنمای پرداخت:</b>\n"
+        f"۱. لطفاً دقیقاً مبلغ بالا را به آدرس ولت مشخص شده انتقال دهید.\n"
         f"۲. پس از انجام انتقال، دکمه <b>«ثبت رسید / شناسه تراکنش (TxID)»</b> را بزنید و کد هش (TxID) یا عکس رسید را ارسال نمایید.\n"
-        f"۳. پس از تایید مدیریت، اشتراک اختصاصی شما به صورت خودکار صادر خواهد شد."
+        f"۳. پس از تایید مدیریت، اشتراک شما بلافاصله تحویل داده خواهد شد."
     )
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(

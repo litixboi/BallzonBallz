@@ -322,16 +322,19 @@ def calculate_adaptive_prices(price_usd: float = 0.0, price_toman: Optional[int]
     eth_amount = round(usdt_amount / eth_rate, 6)
 
     # Calculate estimated network / exchange withdrawal fees
-    # TRX: typical exchange fee is 1 TRX (~$0.34)
-    # USDT-TRC20: typical exchange fee is 1.0 - 1.5 USDT
-    # ETH: typical exchange fee is ~0.001 ETH
+    # 1. TRX: typical exchange fee is 1 TRX (~$0.34)
+    # 2. USDT-TRC20: typical exchange fee is 1.0 USDT
+    # 3. ETH: typical exchange fee / gas is ~0.001 ETH
+    # 4. USDT-ERC20: typical exchange fee is 2.0 USDT
     trx_fee = 1.0
     usdt_fee = 1.0
     eth_fee = 0.001
+    usdt_erc20_fee = 2.0
 
     trx_recommended_gross = round(trx_amount + trx_fee, 2)
     usdt_recommended_gross = round(usdt_amount + usdt_fee, 2)
     eth_recommended_gross = round(eth_amount + eth_fee, 6)
+    usdt_erc20_recommended_gross = round(usdt_amount + usdt_erc20_fee, 2)
 
     return {
         "price_usd": effective_usd,
@@ -351,6 +354,8 @@ def calculate_adaptive_prices(price_usd: float = 0.0, price_toman: Optional[int]
             "usdt_gross": usdt_recommended_gross,
             "eth_fee": eth_fee,
             "eth_gross": eth_recommended_gross,
+            "usdt_erc20_fee": usdt_erc20_fee,
+            "usdt_erc20_gross": usdt_erc20_recommended_gross,
         },
     }
 
