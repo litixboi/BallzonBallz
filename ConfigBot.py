@@ -1708,23 +1708,23 @@ def create_update_banner():
 
         pill_w = (total_stat_w - 2 * 20) // 3
         features = [
-            ("[+] TLS FRAGMENTATION", [
-                "Auto-injected Client Hello splitting",
-                "Bypasses Deep Packet Inspection (DPI)",
-                "Optimized for mobile operator networks",
-                "Full Streisand / V2Box / v2rayNG support"
+            ("[+] CELLULAR ANTI-DPI", [
+                "Auto-injected ClientHello TLS Fragment",
+                "Bypasses mobile DPI (MCI / Irancell / Rightel)",
+                "Stable connection on 4G/5G LTE networks",
+                "Pre-configured for v2rayNG & V2Box"
             ]),
             ("[+] CLEAN PROTOCOLS", [
-                "100% focused on VLESS, VMess & Trojan",
-                "Deprecated Shadowsocks (SS) excluded",
-                "TLS / Reality anti-censorship support",
-                "Direct low-jitter egress routing"
+                "Clean VLESS, VMess & Trojan streams",
+                "Deprecated Shadowsocks (SS) eliminated",
+                "TLS / Reality & CDN WebSocket routing",
+                "Fast streaming for YouTube 4K & Social"
             ]),
-            ("[+] ACTIVE VALIDATION", [
-                "Real Xray-core SOCKS5 proxy test",
-                "Direct HTTPS handshake verified",
-                "Automated 12-hour cluster rotation",
-                "Zero broken or dead configurations"
+            ("[+] LIVE XRAY CORE AUDIT", [
+                "Real SOCKS5 handshake proxy validation",
+                "Active Google & Cloudflare 204 verified",
+                "Automated 12-hour scanner cluster rotation",
+                "100% verified working configs only"
             ])
         ]
         for pi, (ftitle, fbullets) in enumerate(features):
@@ -1942,8 +1942,9 @@ def post_all_countries_to_channel():
             sub_path = script_dir / sub_name
             sub_path.write_text(sub_content, encoding="utf-8")
             caption = (
-                "📦 <b>All-in-One Subscription File</b>\n"
-                "Import this file in <b>v2rayNG</b> / <b>V2Box</b> / <b>Nekoray</b> / <b>Streisand</b> to load every verified config at once.\n\n"
+                "📦 <b>فایل سابسکریپشن تجمیعی تمامی کانفیگ‌ها (All-in-One)</b>\n\n"
+                "🔹 <b>راهنمای اتصال سریع:</b>\n"
+                "این فایل را دانلود کرده و در نرم‌افزارهای <b>v2rayNG</b> (اندروید) یا <b>V2Box / Streisand</b> (آیفون) باز فرمایید تا کلیه سرورهای تست‌شده به صورت یکجا اضافه شوند.\n\n"
                 f"🔗 {CHANNEL_ID}"
             )
             with open(sub_path, 'rb') as doc:
@@ -1959,10 +1960,10 @@ def post_all_countries_to_channel():
         if top_picks:
             picks_line = ", ".join(f"{COUNTRY_DATA[name]['flag']} {name} ×{n}" for name, n in top_picks["countries"])
             caption = (
-                "⚡ <b>Quick Picks - Top 5 Countries</b>\n"
-                f"{picks_line}\n\n"
-                "50 hand-picked configs per country, no duplicate servers - "
-                "a lightweight file for quick access.\n\n"
+                "⚡ <b>گلچین ۵ کشور برتر و پرسرعت (Quick Picks)</b>\n\n"
+                f"🌐 <b>کشورها:</b> {picks_line}\n"
+                "▫️ شامل ۵۰ کانفیگ دست‌چین و باکیفیت بدون تکرار سرورها\n"
+                "▫️ فوق‌العاده سبک و بهینه‌سازی‌شده برای اتصال سریع روزانه\n\n"
                 f"🔗 {CHANNEL_ID}"
             )
             picks_path = script_dir / "top5_quick_picks.txt"
@@ -2493,15 +2494,47 @@ def handle_view_order(call):
             f"⚡ <b>تاریخ فعال‌سازی:</b> <code>{order.get('resolved_at', '-')}</code>\n",
         ]
 
-        # Fetch live stats from Primary and Bridge panels for delivered subs
+        # Fetch live stats concurrently from Primary and Bridge panels for delivered subs
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _fetch_pair(sub_entry):
+            em = sub_entry.get("email")
+            if not em:
+                return None, None
+            with ThreadPoolExecutor(max_workers=2) as pair_pool:
+                f_pri = pair_pool.submit(conpanel_mgr.get_client, em)
+                f_sec = pair_pool.submit(freshpanel_mgr.get_client, em)
+                try:
+                    p_res = f_pri.result(timeout=4.0)
+                except Exception:
+                    p_res = None
+                try:
+                    s_res = f_sec.result(timeout=4.0)
+                except Exception:
+                    s_res = None
+                return p_res, s_res
+
+        stats_by_email = {}
+        unique_subs = [s for s in delivered_subs if s.get("email")]
+        if unique_subs:
+            max_workers = min(6, len(unique_subs))
+            with ThreadPoolExecutor(max_workers=max_workers) as batch_pool:
+                future_map = {batch_pool.submit(_fetch_pair, s): s.get("email") for s in unique_subs}
+                for fut in future_map:
+                    em = future_map[fut]
+                    try:
+                        stats_by_email[em] = fut.result(timeout=5.0)
+                    except Exception as e:
+                        logger.warning("Failed concurrent stats fetch for %s: %s", em, e)
+                        stats_by_email[em] = (None, None)
+
         for idx, s in enumerate(delivered_subs, 1):
             sub_num_str = f" شماره {idx}" if qty > 1 else ""
             lines.append(f"━━━━━━━━━━━━━━━━━━━")
             lines.append(f"🔑 <b>مشخصات و مصرف اشتراک{sub_num_str}:</b>")
 
             email = s.get("email")
-            p_client = conpanel_mgr.get_client(email) if email else None
-            b_client = freshpanel_mgr.get_client(email) if email else None
+            p_client, b_client = stats_by_email.get(email, (None, None))
 
             usage_display = accounting_engine.format_client_usage_display(order, p_client, b_client)
             for l in usage_display["lines"]:
@@ -3752,11 +3785,12 @@ def serve_country_to_chat(chat_id, selected_button):
     with nodes_lock:
         master_nodes_list = list(categorized_nodes.get(selected_button, []))
     total_available = len(master_nodes_list)
+    meta = COUNTRY_DATA.get(selected_button, COUNTRY_DATA["Others"])
 
     if total_available == 0:
         bot.send_message(
             chat_id,
-            f"⚠️ There are currently zero verified working configs for <b>{selected_button}</b> in cache. Please try again later.",
+            f"⚠️ در حال حاضر هیچ کانفیگ فعال و سالمی برای <b>{meta['flag']} {selected_button}</b> در سیستم موجود نیست. لطفاً ساعاتی دیگر مجدداً تلاش فرمایید.",
             parse_mode="HTML"
         )
         return
@@ -3769,7 +3803,7 @@ def serve_country_to_chat(chat_id, selected_button):
     inform_msg = ""
 
     if current_offset >= total_available:
-        inform_msg = f"⚠️ <b>Notice:</b> You have already seen all unique configurations for {selected_button}.\n🔄 <i>Resetting your rotation back to the beginning...</i>\n\n"
+        inform_msg = f"⚠️ <b>توجه:</b> شما تمامی کانفیگ‌های موجود برای {meta['flag']} {selected_button} را مشاهده کرده‌اید.\n🔄 <i>چرخه دریافت از ابتدا ریست شد...</i>\n\n"
         current_offset = 0
 
     start_idx = current_offset
@@ -3778,18 +3812,16 @@ def serve_country_to_chat(chat_id, selected_button):
     served_count = len(nodes_to_serve)
 
     if served_count < 3 and start_idx != 0:
-        inform_msg = f"ℹ️ <b>Notice:</b> Only <b>{served_count}</b> new unique configs were remaining for {selected_button}. Running out of options soon!\n\n"
+        inform_msg = f"ℹ️ <b>توجه:</b> تنها <b>{served_count}</b> کانفیگ جدید برای {selected_button} باقی مانده بود.\n\n"
 
     if total_available < 3:
-        inform_msg = f"ℹ️ <b>Notice:</b> There are only {total_available} total configurations available in the system for this country. Repetition is inevitable.\n\n"
+        inform_msg = f"ℹ️ <b>توجه:</b> در حال حاضر تنها {total_available} کانفیگ سالم برای این کشور در دیتابیس موجود است.\n\n"
 
     with offsets_lock:
         user_session_offsets[chat_id][selected_button] = start_idx + served_count
 
-    meta = COUNTRY_DATA.get(selected_button, COUNTRY_DATA["Others"])
-
     # Send introductory notice
-    response_text = f"{inform_msg}✨ <b>Your 3 Verified Configs for {meta['flag']} {selected_button} (Tap to Copy):</b>"
+    response_text = f"{inform_msg}✨ <b>۳ کانفیگ تست‌شده و فعال برای {meta['flag']} {selected_button} (با لمس کپی کنید):</b>"
     bot.send_message(chat_id, response_text, parse_mode="HTML")
 
     # Send each config inside a code block for 1-tap copy on mobile Telegram
@@ -3810,9 +3842,10 @@ def serve_country_to_chat(chat_id, selected_button):
                 doc,
                 visible_file_name=filename,
                 caption=(
-                    f"📄 <b>All {total_available} Configs for {selected_button}</b>\n"
-                    f"📅 Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"🔗 Channel: {CHANNEL_ID}"
+                    f"📄 <b>لیست کامل {total_available} کانفیگ فعال برای {meta['flag']} {selected_button}</b>\n"
+                    f"📅 تاریخ و ساعت تولید: <code>{time.strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
+                    f"💡 <i>جهت اتصال، این فایل را در برنامه v2rayNG یا V2Box باز فرمایید.</i>\n\n"
+                    f"🔗 {CHANNEL_ID}"
                 ),
                 parse_mode="HTML"
             )

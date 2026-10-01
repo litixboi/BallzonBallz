@@ -12,3 +12,4 @@ orders.db*
 test_scratch*
 test_integration.py
 .claude/
+*_backup.jpg

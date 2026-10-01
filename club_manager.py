@@ -251,11 +251,16 @@ class ClubManager:
                 renewed = 0
                 orders = 0
                 spent = 0
+                purchased_refs = 0
             else:
                 referrals = row["referral_count"] or 0
                 renewed = row["renewed_months"] or 0
                 orders = row["total_orders"] or 0
                 spent = row["total_spent_toman"] or 0
+                purch_row = conn.execute(
+                    "SELECT COUNT(*) FROM referral_events WHERE referrer_id = ? AND status = 'PURCHASED'", (user_id,)
+                ).fetchone()
+                purchased_refs = purch_row[0] if purch_row else 0
 
         # 1. Referral discount: 5% per referral (up to 3 = 15%)
         ref_discount = min(15, referrals * 5)
@@ -269,6 +274,7 @@ class ClubManager:
         return {
             "user_id": user_id,
             "referral_count": referrals,
+            "purchased_referrals": purchased_refs,
             "renewed_months": renewed,
             "total_orders": orders,
             "total_spent_toman": spent,
@@ -310,6 +316,7 @@ class ClubManager:
         """Returns beautiful, engaging Persian message for Customer Club."""
         info = self.get_user_club_info(user_id)
         ref_count = info["referral_count"]
+        purchased_count = info.get("purchased_referrals", 0)
         ref_pct = info["referral_discount_pct"]
         renew_m = info["renewed_months"]
         loyalty_pct = info["loyalty_discount_pct"]
@@ -326,6 +333,7 @@ class ClubManager:
             "<b>📊 وضعیت امتیازات و تخفیف‌های شما:</b>\n\n"
             f"👥 <b>۱. تخفیف دعوت از دوستان:</b> <b>{ref_pct}٪</b> (از سقف ۱۵٪)\n"
             f"▫️ تعداد دوستان معرفی‌شده: <b>{ref_count} نفر</b>\n"
+            f"▫️ خریدهای موفق دوستان: <b>{purchased_count} مورد</b>\n"
             "▫️ <i>فرمول: به ازای هر معرفی ۵٪ تخفیف (تا ۳ نفر = ۱۵٪)</i>\n\n"
             f"🔄 <b>۲. تخفیف وفاداری و تمدید:</b> <b>{loyalty_pct}٪</b> (از سقف ۱۵٪)\n"
             f"▫️ سابقه تمدید و اشتراک: <b>{renew_m} ماه</b>\n"

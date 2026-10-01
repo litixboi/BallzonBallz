@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import random
+import secrets
 import sqlite3
 import threading
 import time
@@ -189,21 +190,25 @@ class OrderManager:
         return d
 
     def _export_json_snapshot(self):
-        """Atomic snapshot export to orders.json for backward compatibility."""
-        with _lock:
-            try:
-                with self._get_connection() as conn:
-                    rows = conn.execute("SELECT * FROM orders ORDER BY created_at ASC").fetchall()
-                export_dict = {}
-                for r in rows:
-                    d = self._row_to_dict(r)
-                    export_dict[d["order_id"]] = d
+        """Asynchronous non-blocking snapshot export to orders.json for backward compatibility."""
+        def _export_task():
+            with _lock:
+                try:
+                    with self._get_connection() as conn:
+                        rows = conn.execute("SELECT * FROM orders ORDER BY created_at ASC").fetchall()
+                    export_dict = {}
+                    for r in rows:
+                        d = self._row_to_dict(r)
+                        export_dict[d["order_id"]] = d
 
-                tmp = self.json_fallback.with_name(f"{self.json_fallback.stem}_{threading.get_ident()}_{time.time_ns()}.tmp")
-                tmp.write_text(json.dumps(export_dict, indent=2, ensure_ascii=False), encoding="utf-8")
-                tmp.replace(self.json_fallback)
-            except Exception as e:
-                logger.warning("Could not export JSON snapshot of orders: %s", e)
+                    tmp = self.json_fallback.with_name(f"{self.json_fallback.stem}_{threading.get_ident()}_{time.time_ns()}.tmp")
+                    tmp.write_text(json.dumps(export_dict, indent=2, ensure_ascii=False), encoding="utf-8")
+                    tmp.replace(self.json_fallback)
+                except Exception as e:
+                    logger.warning("Could not export JSON snapshot of orders: %s", e)
+
+        t = threading.Thread(target=_export_task, daemon=True, name="OrdersJsonExporter")
+        t.start()
 
     def create_order(
         self,
@@ -224,8 +229,10 @@ class OrderManager:
         """Atomically create a new pending order and return its order_id."""
         with _lock:
             with self._get_connection() as conn:
+                chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
                 while True:
-                    oid = f"ORD-{random.randint(10000, 99999)}"
+                    rand_code = "".join(secrets.choice(chars) for _ in range(6))
+                    oid = f"ORD-{rand_code}"
                     existing = conn.execute("SELECT 1 FROM orders WHERE order_id = ?", (oid,)).fetchone()
                     if not existing:
                         break
