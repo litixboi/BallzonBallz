@@ -9,31 +9,36 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable
 
-from conpanel_api import conpanel_mgr, freshpanel_mgr
+from conpanel_api import conpanel_mgr, botpanel_mgr, freshpanel_mgr, asiapanel_mgr
 
 logger = logging.getLogger("PanelSyncManager")
 
 script_dir = Path(__file__).parent.resolve()
-SYNC_INTERVAL_SEC = int(os.getenv("PANEL_SYNC_INTERVAL_SEC", "900"))  # Default: 15 minutes (15-30 min spec)
-SECONDARY_INBOUND_ID = int(os.getenv("SECONDARY_INBOUND_ID", "2"))  # Inbound 2: ⚡ Bridge [2X]
+SYNC_INTERVAL_SEC = int(os.getenv("PANEL_SYNC_INTERVAL_SEC", "900"))  # Default: 15 minutes
 
 
 class PanelSyncManager:
-    """Production-grade bi-directional dual-panel synchronization engine.
+    """Production-grade multi-datacenter synchronization engine.
     Harmonizes client UUIDs, subIds, traffic quotas, expiry dates, and enabled states
-    between Primary (Germany c23) and Secondary (Domestic c13 freshbridge).
-    Enforces highest recorded consumption collision resolution and alerts on reachability timeouts."""
+    across Dual German Primary Datacenters (Main c23 + Bot c23)
+    and Dual Domestic Bridges (Pars Online c13 Inbound 2 + Asiatech c11 Inbound 1)."""
 
     def __init__(
         self,
-        primary=conpanel_mgr,
-        secondary=freshpanel_mgr,
-        secondary_inbound_id: int = SECONDARY_INBOUND_ID,
+        german_panels=None,
+        bridge_panels=None,
+        primary=None,
+        secondary=None,
+        secondary_inbound_id: int = 2,
         alert_callback: Optional[Callable[[str], Any]] = None,
     ):
-        self.primary = primary
-        self.secondary = secondary
-        self.secondary_inbound_id = secondary_inbound_id
+        if primary is not None or secondary is not None:
+            self.german_panels = [primary] if primary else (german_panels or [conpanel_mgr, botpanel_mgr])
+            self.bridge_panels = [(secondary, secondary_inbound_id)] if secondary else (bridge_panels or [(freshpanel_mgr, 2), (asiapanel_mgr, 1)])
+        else:
+            self.german_panels = german_panels or [conpanel_mgr, botpanel_mgr]
+            self.bridge_panels = bridge_panels or [(freshpanel_mgr, 2), (asiapanel_mgr, 1)]
+
         self.alert_callback = alert_callback
         self.last_sync_time = 0.0
         self.last_sync_status: Dict[str, Any] = {
@@ -41,159 +46,164 @@ class PanelSyncManager:
             "added": 0,
             "updated": 0,
             "deleted": 0,
-            "total_primary": 0,
-            "total_secondary": 0,
+            "total_german": 0,
+            "bridges": {},
             "last_error": None,
             "timestamp": None,
         }
         self._lock = threading.Lock()
 
     def sync_once(self) -> Dict[str, Any]:
-        """Perform a single comprehensive synchronization and state reconciliation cycle."""
+        """Perform a single comprehensive synchronization and state reconciliation cycle across all datacenters."""
         with self._lock:
             result = {
                 "success": False,
                 "added": 0,
                 "updated": 0,
                 "deleted": 0,
-                "total_primary": 0,
-                "total_secondary": 0,
+                "total_german": 0,
+                "bridges": {},
                 "last_error": None,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
-            # 1. Authenticate both panels
-            pri_ok = self.primary.ensure_auth()
-            sec_ok = self.secondary.ensure_auth()
+            # 1. Authenticate German panels
+            active_german = []
+            for gp in self.german_panels:
+                if gp.ensure_auth():
+                    active_german.append(gp)
+                else:
+                    logger.warning("[Sync] German panel '%s' failed auth", gp.name)
 
-            if not pri_ok or not sec_ok:
-                err_msg = f"Panel auth failed: Primary={pri_ok}, Secondary={sec_ok}"
-                logger.warning("[%s] %s", self.__class__.__name__, err_msg)
+            if not active_german:
+                err_msg = "All German master panels failed authentication!"
+                logger.error("[Sync] %s", err_msg)
                 result["last_error"] = err_msg
                 self.last_sync_status = result
                 if self.alert_callback:
                     try:
-                        self.alert_callback(f"⚠️ <b>هشدار هماهنگ‌سازی پنل‌ها:</b> خطا در احراز هویت سرورها\n<code>{err_msg}</code>")
-                    except Exception as e:
-                        logger.error("Failed to invoke alert callback: %s", e)
+                        self.alert_callback(f"⚠️ <b>هشدار هماهنگ‌سازی:</b> تمام سرورهای اصلی آلمان از دسترس خارج شدند.\n<code>{err_msg}</code>")
+                    except Exception:
+                        pass
                 return result
 
-            # 2. Export client datasets
-            try:
-                pri_items = self.primary.export_clients()
-                sec_items = self.secondary.export_clients()
-            except Exception as e:
-                err_msg = f"Export exception: {e}"
-                logger.error("[%s] %s", self.__class__.__name__, err_msg)
-                result["last_error"] = err_msg
-                self.last_sync_status = result
-                return result
+            # 2. Collect master client catalog across German panels
+            master_by_email: Dict[str, Dict[str, Any]] = {}
+            for gp in active_german:
+                try:
+                    items = gp.export_clients()
+                    for item in items:
+                        cl = item.get("client")
+                        if not cl or not cl.get("email"):
+                            continue
+                        em = cl["email"]
+                        if em not in master_by_email:
+                            master_by_email[em] = dict(cl)
+                        else:
+                            # Highest quota / latest expiry wins
+                            cur = master_by_email[em]
+                            cur["totalGB"] = max(cur.get("totalGB", 0), cl.get("totalGB", 0))
+                            cur["expiryTime"] = max(cur.get("expiryTime", 0), cl.get("expiryTime", 0))
+                            cur["enable"] = cur.get("enable", True) and cl.get("enable", True)
+                except Exception as e:
+                    logger.error("[Sync] Error exporting from %s: %s", gp.name, e)
 
-            if not pri_items and not sec_items:
-                logger.info("Both panels returned empty client lists.")
-                result["success"] = True
-                self.last_sync_status = result
-                return result
+            result["total_german"] = len(master_by_email)
 
-            # Index clients by email and canonical identity
-            pri_by_email: Dict[str, Dict[str, Any]] = {
-                item["client"]["email"]: item["client"] for item in pri_items if item.get("client", {}).get("email")
-            }
-            sec_by_email: Dict[str, Dict[str, Any]] = {
-                item["client"]["email"]: item["client"] for item in sec_items if item.get("client", {}).get("email")
-            }
-
-            result["total_primary"] = len(pri_by_email)
-            result["total_secondary"] = len(sec_by_email)
-
-            added = 0
-            updated = 0
-            deleted = 0
-
-            # --- Phase A: Replicate New Clients into Secondary Inbound 2 ---
-            to_import = []
-            for email, p_client in pri_by_email.items():
-                if email not in sec_by_email:
-                    # Clean copy of client payload
-                    import_client = dict(p_client)
-                    to_import.append({
-                        "client": import_client,
-                        "inboundIds": [self.secondary_inbound_id],
-                    })
-
-            if to_import:
-                if self.secondary.import_clients(to_import):
-                    added = len(to_import)
-                    logger.info("[Sync:Add] Replicated %d new client(s) to Secondary Inbound %d: %s",
-                                added, self.secondary_inbound_id, [c["client"]["email"] for c in to_import])
-                else:
-                    logger.error("[Sync:Add] Failed to batch import %d clients to Secondary panel", len(to_import))
-
-            # --- Phase B: Harmonize Attributes & Collision Resolution ---
+            # 3. Synchronize to each domestic bridge panel
             fields_to_harmonize = ["id", "subId", "totalGB", "expiryTime", "enable", "limitHwid", "limitIp"]
 
-            for email, p_client in pri_by_email.items():
-                if email in sec_by_email:
-                    s_client = sec_by_email[email]
-                    needs_update = False
+            total_added = 0
+            total_updated = 0
+            total_deleted = 0
 
-                    # 1. Attribute drift check
-                    for field in fields_to_harmonize:
-                        if p_client.get(field) != s_client.get(field):
-                            needs_update = True
-                            break
+            for bridge, inbound_id in self.bridge_panels:
+                bridge_name = bridge.name
+                bridge_stat = {"added": 0, "updated": 0, "deleted": 0, "total": 0, "ok": False}
+                result["bridges"][bridge_name] = bridge_stat
 
-                    # 2. Collision resolution for totalGB and expiryTime:
-                    # Latest payment / highest quota wins
-                    effective_total = max(p_client.get("totalGB", 0), s_client.get("totalGB", 0))
-                    effective_expiry = max(p_client.get("expiryTime", 0), s_client.get("expiryTime", 0))
+                if not bridge.ensure_auth():
+                    logger.warning("[Sync] Bridge panel '%s' failed auth, skipping cycle", bridge_name)
+                    continue
 
-                    if effective_total != s_client.get("totalGB"):
-                        s_client["totalGB"] = effective_total
-                        needs_update = True
-                    if effective_expiry != s_client.get("expiryTime"):
-                        s_client["expiryTime"] = effective_expiry
-                        needs_update = True
+                try:
+                    bridge_items = bridge.export_clients()
+                    bridge_by_email = {
+                        item["client"]["email"]: item["client"] for item in bridge_items if item.get("client", {}).get("email")
+                    }
+                    bridge_stat["total"] = len(bridge_by_email)
 
-                    # 3. Quota enforcement: if primary disabled client, secondary must be disabled
-                    if not p_client.get("enable", True) and s_client.get("enable", True):
-                        s_client["enable"] = False
-                        needs_update = True
+                    # A. Replicate missing clients into bridge
+                    to_import = []
+                    for email, m_client in master_by_email.items():
+                        if email not in bridge_by_email:
+                            to_import.append({
+                                "client": dict(m_client),
+                                "inboundIds": [inbound_id],
+                            })
 
-                    # Ensure UUID and subId remain strictly identical across mirrors
-                    if s_client.get("id") != p_client.get("id"):
-                        s_client["id"] = p_client.get("id")
-                        needs_update = True
-                    if s_client.get("subId") != p_client.get("subId"):
-                        s_client["subId"] = p_client.get("subId")
-                        needs_update = True
+                    if to_import:
+                        if bridge.import_clients(to_import):
+                            cnt = len(to_import)
+                            bridge_stat["added"] = cnt
+                            total_added += cnt
+                            logger.info("[Sync:Add] Replicated %d client(s) to %s (Inbound %d)", cnt, bridge_name, inbound_id)
+                        else:
+                            logger.error("[Sync:Add] Failed to import batch into %s", bridge_name)
 
-                    if needs_update:
-                        if self.secondary.update_client(email, s_client):
-                            updated += 1
-                            logger.info("[Sync:Update] Harmonized client '%s' on Secondary panel", email)
+                    # B. Harmonize modified attributes & quotas
+                    b_updated = 0
+                    for email, m_client in master_by_email.items():
+                        if email in bridge_by_email:
+                            b_client = bridge_by_email[email]
+                            needs_update = False
 
-            # --- Phase C: Delete Orphan Clients ---
-            for email in list(sec_by_email.keys()):
-                # Only delete customer accounts (tg_*) if removed from primary
-                if email.startswith("tg_") and email not in pri_by_email:
-                    if self.secondary.delete_client(email):
-                        deleted += 1
-                        logger.info("[Sync:Delete] Cleaned orphan client '%s' from Secondary panel", email)
+                            for field in fields_to_harmonize:
+                                if m_client.get(field) != b_client.get(field):
+                                    needs_update = True
+                                    break
 
-            result["added"] = added
-            result["updated"] = updated
-            result["deleted"] = deleted
+                            if needs_update:
+                                updated_payload = dict(b_client)
+                                for f in fields_to_harmonize:
+                                    if f in m_client:
+                                        updated_payload[f] = m_client[f]
+
+                                if bridge.update_client(email, updated_payload):
+                                    b_updated += 1
+
+                    bridge_stat["updated"] = b_updated
+                    total_updated += b_updated
+
+                    # C. Delete orphan clients (only tg_* bot clients removed from all German masters)
+                    b_deleted = 0
+                    for email, b_client in list(bridge_by_email.items()):
+                        is_bot_client = email.startswith("tg_") or b_client.get("tgId", 0) > 0 or b_client.get("group") == "Customers"
+                        if is_bot_client and email not in master_by_email:
+                            if bridge.delete_client(email):
+                                b_deleted += 1
+
+                    bridge_stat["deleted"] = b_deleted
+                    total_deleted += b_deleted
+                    bridge_stat["ok"] = True
+
+                except Exception as e_br:
+                    logger.error("[Sync] Exception syncing to %s: %s", bridge_name, e_br)
+
+            result["added"] = total_added
+            result["updated"] = total_updated
+            result["deleted"] = total_deleted
             result["success"] = True
             self.last_sync_time = time.time()
             self.last_sync_status = result
 
-            if added > 0 or updated > 0 or deleted > 0:
+            if total_added > 0 or total_updated > 0 or total_deleted > 0:
                 logger.info(
-                    "[Sync Complete] Added: %d, Updated: %d, Deleted: %d. Total Primary: %d, Total Secondary: %d",
-                    added, updated, deleted, result["total_primary"], result["total_secondary"]
+                    "[Sync Complete] Total German: %d | Added: %d, Updated: %d, Deleted: %d across %d bridges",
+                    len(master_by_email), total_added, total_updated, total_deleted, len(self.bridge_panels)
                 )
             return result
+
 
     def run_sync_loop(self, interval_sec: int = SYNC_INTERVAL_SEC):
         """Continuous background synchronization loop."""

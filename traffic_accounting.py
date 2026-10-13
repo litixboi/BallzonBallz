@@ -20,14 +20,16 @@ class TrafficAccountingEngine:
         purchased_volume_gb: float,
         primary_client: Optional[Dict[str, Any]] = None,
         bridge_client: Optional[Dict[str, Any]] = None,
+        bridge2_client: Optional[Dict[str, Any]] = None,
         order_multiplier: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Compute exact weighted bandwidth usage across both primary and secondary bridge routes.
+        """Compute exact weighted bandwidth usage across primary and dual domestic bridge routes.
 
         Args:
             purchased_volume_gb: Total plan volume purchased in GB.
             primary_client: Dict from 3X-UI for primary Germany instance.
-            bridge_client: Dict from 3X-UI for secondary Domestic bridge instance.
+            bridge_client: Dict from 3X-UI for Pars Online bridge instance.
+            bridge2_client: Dict from 3X-UI for Asiatech bridge instance.
             order_multiplier: Optional custom multiplier on the order (e.g. 2.0 for premium plans).
 
         Returns:
@@ -41,10 +43,12 @@ class TrafficAccountingEngine:
         p_down = primary_client.get("down", 0) if primary_client else 0
         p_raw_bytes = max(0, p_up + p_down)
 
-        # Secondary bridge panel raw bytes
-        b_up = bridge_client.get("up", 0) if bridge_client else 0
-        b_down = bridge_client.get("down", 0) if bridge_client else 0
-        b_raw_bytes = max(0, b_up + b_down)
+        # Secondary & Tertiary bridge panels raw bytes (Pars Online + Asiatech)
+        b1_up = bridge_client.get("up", 0) if bridge_client else 0
+        b1_down = bridge_client.get("down", 0) if bridge_client else 0
+        b2_up = bridge2_client.get("up", 0) if bridge2_client else 0
+        b2_down = bridge2_client.get("down", 0) if bridge2_client else 0
+        b_raw_bytes = max(0, b1_up + b1_down + b2_up + b2_down)
 
         # Multiplier determination
         p_mult = order_multiplier if (order_multiplier and order_multiplier > 1.0) else self.primary_multiplier
@@ -90,13 +94,15 @@ class TrafficAccountingEngine:
         order: Dict[str, Any],
         primary_client: Optional[Dict[str, Any]] = None,
         bridge_client: Optional[Dict[str, Any]] = None,
+        bridge2_client: Optional[Dict[str, Any]] = None,
         primary_panel_mgr=None,
         bridge_panel_mgr=None,
+        bridge2_panel_mgr=None,
     ) -> Dict[str, Any]:
         """Evaluate weighted usage and automatically disable client if synthetic 2x quota is reached."""
         plan_vol = float(order.get("volume_gb", 30))
         order_mult = float(order.get("multiplier", 1.0))
-        calc = self.calculate_weighted_consumption(plan_vol, primary_client, bridge_client, order_mult)
+        calc = self.calculate_weighted_consumption(plan_vol, primary_client, bridge_client, bridge2_client, order_mult)
 
         enforced = False
         if calc["is_depleted"]:
@@ -107,7 +113,7 @@ class TrafficAccountingEngine:
                 calc["used_gb"],
                 plan_vol,
             )
-            # Disable on Primary Panel
+            # Disable on Primary/Bot Panel
             if primary_panel_mgr:
                 try:
                     primary_panel_mgr.set_client_enabled(email, False)
@@ -115,13 +121,21 @@ class TrafficAccountingEngine:
                 except Exception as e:
                     logger.error("Failed to disable client %s on primary panel: %s", email, e)
 
-            # Disable on Secondary Bridge Panel
+            # Disable on Secondary Bridge Panel (Pars Online)
             if bridge_panel_mgr:
                 try:
                     bridge_panel_mgr.set_client_enabled(email, False)
                     enforced = True
                 except Exception as e:
-                    logger.error("Failed to disable client %s on bridge panel: %s", email, e)
+                    logger.error("Failed to disable client %s on Pars Online bridge panel: %s", email, e)
+
+            # Disable on Tertiary Bridge Panel (Asiatech)
+            if bridge2_panel_mgr:
+                try:
+                    bridge2_panel_mgr.set_client_enabled(email, False)
+                    enforced = True
+                except Exception as e:
+                    logger.error("Failed to disable client %s on Asiatech bridge panel: %s", email, e)
 
         calc["enforced"] = enforced
         return calc
@@ -131,6 +145,7 @@ class TrafficAccountingEngine:
         order: Dict[str, Any],
         primary_client: Optional[Dict[str, Any]] = None,
         bridge_client: Optional[Dict[str, Any]] = None,
+        bridge2_client: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Generate human-readable display lines for Telegram /orders interface with 2x notice."""
         plan_vol = float(order.get("volume_gb", 30))
@@ -139,7 +154,7 @@ class TrafficAccountingEngine:
         dur_map = {30: "۱ ماهه", 90: "۳ ماهه", 180: "۶ ماهه"}
         dur_str = dur_map.get(dur_days, f"{dur_days} روز")
 
-        if not primary_client and not bridge_client:
+        if not primary_client and not bridge_client and not bridge2_client:
             return {
                 "has_stats": False,
                 "lines": [
@@ -147,7 +162,7 @@ class TrafficAccountingEngine:
                 ],
             }
 
-        calc = self.calculate_weighted_consumption(plan_vol, primary_client, bridge_client, order_mult)
+        calc = self.calculate_weighted_consumption(plan_vol, primary_client, bridge_client, bridge2_client, order_mult)
 
         # Calculate days left from expiryTime
         exp_ms = 0
@@ -155,6 +170,9 @@ class TrafficAccountingEngine:
             exp_ms = primary_client.get("expiryTime", 0)
         elif bridge_client:
             exp_ms = bridge_client.get("expiryTime", 0)
+        elif bridge2_client:
+            exp_ms = bridge2_client.get("expiryTime", 0)
+
 
         if exp_ms > 0:
             days_left = max(0, int((exp_ms - time.time() * 1000) / (86400 * 1000)))

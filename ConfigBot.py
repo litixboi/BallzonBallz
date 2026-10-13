@@ -32,12 +32,23 @@ from telebot.apihelper import ApiTelegramException
 import geoip2.database
 
 import crypto_manager
-from conpanel_api import conpanel_mgr, freshpanel_mgr, BRIDGE_DOMAIN, PUBLIC_DOMAIN
-from order_manager import order_mgr
+from conpanel_api import conpanel_mgr, botpanel_mgr, freshpanel_mgr, asiapanel_mgr, BRIDGE_DOMAIN, BRIDGE2_DOMAIN, PUBLIC_DOMAIN, BOT_DOMAIN
+from order_manager import order_mgr, DEFAULT_DB_PATH
 from club_manager import club_manager
 import persian_announcements
 from traffic_accounting import accounting_engine
 from sync_manager import sync_mgr, SYNC_INTERVAL_SEC
+from bank_sms_manager import (
+    BankSMSManager,
+    start_webhook_server,
+    GeminiReceiptOCR,
+    DESTINATION_CARD_RAW,
+    DESTINATION_HOLDER_FA,
+    WEBHOOK_SECRET_TOKEN,
+    IranianBankSMSParser,
+)
+
+bank_sms_mgr = BankSMSManager(DEFAULT_DB_PATH)
 
 # --- FORCE IPv4 GLOBALLY TO PREVENT [Errno 101] Network is unreachable ON CLOUD HOSTS ---
 import urllib3.util.connection as urllib3_conn
@@ -1436,9 +1447,10 @@ def send_admin_order_notification(admin_chat: int, order: dict) -> bool:
         f"🆔 <b>شناسه سفارش:</b> <code>{safe_oid}</code>\n"
         f"👤 <b>کاربر:</b> @{safe_user} (ID: <code>{safe_uid}</code> | نام: {safe_first})\n"
         f"📦 <b>پلن انتخابی:</b> {safe_plan} ({order['volume_gb']}GB / {order['duration_days']} روز)\n"
-        f"🌐 <b>شبکه:</b> {safe_net}\n"
-        f"💰 <b>مبلغ مورد انتظار:</b> {order['crypto_amount']} {order['crypto_currency']}\n"
-        f"🔗 <b>شناسه تراکنش (TxID):</b>\n<code>{safe_tx}</code>"
+        f"🌐 <b>شبکه / روش:</b> {safe_net}\n"
+        + (f"💰 <b>مبلغ ریالی (با شناسه):</b> <code>{order.get('total_amount_rials', 0):,}</code> ریال (+{order.get('rial_suffix', 0)} ریال شناسه)\n" if (order.get("payment_method") == "CARD_TO_CARD" or order.get("total_amount_rials", 0) > 0) else f"💰 <b>مبلغ مورد انتظار:</b> {order['crypto_amount']} {order['crypto_currency']}\n")
+        + (f"🔢 <b>کد پیگیری:</b> <code>{html.escape(str(order.get('trace_number')))}</code>\n" if order.get('trace_number') else "")
+        + f"🔗 <b>شناسه تراکنش (TxID) / شرح:</b>\n<code>{safe_tx}</code>"
     )
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -2500,10 +2512,14 @@ def handle_view_order(call):
         def _fetch_pair(sub_entry):
             em = sub_entry.get("email")
             if not em:
-                return None, None
-            with ThreadPoolExecutor(max_workers=2) as pair_pool:
-                f_pri = pair_pool.submit(conpanel_mgr.get_client, em)
+                return None, None, None
+            with ThreadPoolExecutor(max_workers=3) as pair_pool:
+                def _get_pri():
+                    c = botpanel_mgr.get_client(em)
+                    return c if c else conpanel_mgr.get_client(em)
+                f_pri = pair_pool.submit(_get_pri)
                 f_sec = pair_pool.submit(freshpanel_mgr.get_client, em)
+                f_ter = pair_pool.submit(asiapanel_mgr.get_client, em)
                 try:
                     p_res = f_pri.result(timeout=4.0)
                 except Exception:
@@ -2512,7 +2528,11 @@ def handle_view_order(call):
                     s_res = f_sec.result(timeout=4.0)
                 except Exception:
                     s_res = None
-                return p_res, s_res
+                try:
+                    t_res = f_ter.result(timeout=4.0)
+                except Exception:
+                    t_res = None
+                return p_res, s_res, t_res
 
         stats_by_email = {}
         unique_subs = [s for s in delivered_subs if s.get("email")]
@@ -2526,7 +2546,7 @@ def handle_view_order(call):
                         stats_by_email[em] = fut.result(timeout=5.0)
                     except Exception as e:
                         logger.warning("Failed concurrent stats fetch for %s: %s", em, e)
-                        stats_by_email[em] = (None, None)
+                        stats_by_email[em] = (None, None, None)
 
         for idx, s in enumerate(delivered_subs, 1):
             sub_num_str = f" شماره {idx}" if qty > 1 else ""
@@ -2534,21 +2554,34 @@ def handle_view_order(call):
             lines.append(f"🔑 <b>مشخصات و مصرف اشتراک{sub_num_str}:</b>")
 
             email = s.get("email")
-            p_client, b_client = stats_by_email.get(email, (None, None))
+            p_client, b1_client, b2_client = stats_by_email.get(email, (None, None, None))
 
-            usage_display = accounting_engine.format_client_usage_display(order, p_client, b_client)
+            usage_display = accounting_engine.format_client_usage_display(order, p_client, b1_client, b2_client)
             for l in usage_display["lines"]:
                 lines.append(l)
 
-            lines.append(f"🔗 <b>لینک ساب اصلی (Base64):</b>\n<code>{html.escape(s.get('sub_url', ''))}</code>")
-            if s.get("json_url"):
-                lines.append(f"📱 <b>لینک ساب Sing-box (JSON):</b>\n<code>{html.escape(s['json_url'])}</code>")
-            bridge_u = s.get("bridge_url")
+            sub_id = s.get("subId")
+            if not sub_id and s.get("sub_url"):
+                sub_id = s["sub_url"].rstrip("/").split("/")[-1]
+
+            bridge_u = s.get("bridge_url") or (f"https://{BRIDGE_DOMAIN}/sub/{sub_id}" if sub_id else "")
+            bridge2_u = s.get("bridge2_url") or (f"https://{BRIDGE2_DOMAIN}/sub/{sub_id}" if sub_id else "")
+            direct_u = s.get("sub_url", "")
+
             if bridge_u:
                 bridge_u = bridge_u.replace("bridge.litontheix.ir", BRIDGE_DOMAIN)
-                lines.append(f"🌉 <b>لینک ساب کمکی (Mirror / Bridge):</b>\n<code>{html.escape(bridge_u)}</code>")
+                lines.append(f"⚡ <b>ساب پارس آنلاین (ملی 2X - همراه/ایرانسل):</b>\n<code>{html.escape(bridge_u)}</code>")
+            if bridge2_u:
+                lines.append(f"⚡ <b>ساب آسیاتک (ملی 2X - مسیر کمکی):</b>\n<code>{html.escape(bridge2_u)}</code>")
+            if direct_u:
+                lines.append(f"🌐 <b>ساب مستقیم آلمان (1X با Fragment):</b>\n<code>{html.escape(direct_u)}</code>")
+
+            if s.get("json_url"):
+                lines.append(f"📱 <b>لینک ساب Sing-box (JSON):</b>\n<code>{html.escape(s['json_url'])}</code>")
             if s.get("bridge_json_url"):
-                lines.append(f"🚀 <b>لینک Sing-box کمکی (Bridge JSON):</b>\n<code>{html.escape(s['bridge_json_url'])}</code>")
+                lines.append(f"🚀 <b>لینک Sing-box پارس آنلاین:</b>\n<code>{html.escape(s['bridge_json_url'])}</code>")
+            if s.get("bridge2_json_url"):
+                lines.append(f"🚀 <b>لینک Sing-box آسیاتک:</b>\n<code>{html.escape(s['bridge2_json_url'])}</code>")
 
         lines.append(f"━━━━━━━━━━━━━━━━━━━\n")
         lines.append(
@@ -3320,12 +3353,13 @@ def handle_plan_selection(call):
         f"▫️ <b>پلن انتخابی:</b> {volume_gb} گیگابایت | {dur_str} ({devices} کاربره)\n"
         f"▫️ <b>تعداد:</b> <b>{qty} عدد</b>\n"
         f"{cost_block}"
-        f"💳 <b>مبلغ نهایی قابل پرداخت (با احتساب کارمزد انتقال):</b>\n"
+        f"💳 <b>مبالغ قابل پرداخت:</b>\n"
+        f"💳 <b>کارت به کارت شتابی:</b> <b>{final_toman:,} تومان</b> <i>(تایید خودکار و آنی)</i>\n"
         f"🔺 <b>ترون (TRX):</b> <code>{fees.get('trx_gross', calc['trx'])} TRX</code> <i>(پیشنهادی ⚡️ کمترین کارمزد)</i>\n"
         f"💵 <b>تتر ترون (USDT-TRC20):</b> <code>{fees.get('usdt_gross', calc['usdt']):.2f} USDT</code>\n"
         f"🔹 <b>اتریوم (ETH):</b> <code>{fees.get('eth_gross', calc['eth'])} ETH</code>\n"
         f"💵 <b>تتر اتریوم (USDT-ERC20):</b> <code>{fees.get('usdt_erc20_gross', calc['usdt']):.2f} USDT</code>\n\n"
-        f"👇 <i>روش پرداخت مورد نظر را جهت دریافت آدرس کیف پول انتخاب فرمایید:</i>"
+        f"👇 <i>روش پرداخت مورد نظر را جهت دریافت آدرس یا شماره کارت انتخاب فرمایید:</i>"
     )
 
     markup = types.InlineKeyboardMarkup(row_width=4)
@@ -3336,16 +3370,125 @@ def handle_plan_selection(call):
     markup.row(*qty_buttons)
 
     markup.add(
-        types.InlineKeyboardButton("🔺 ۱. ترون (TRX) - شبکه Tron ⚡️ (کمترین کارمزد)", callback_data=f"pay_net:{plan_id}:trx:{qty}"),
-        types.InlineKeyboardButton("💵 ۲. تتر (USDT) - شبکه ترون TRC-20", callback_data=f"pay_net:{plan_id}:usdt_trc20:{qty}"),
-        types.InlineKeyboardButton("🔹 ۳. اتریوم (ETH) - شبکه Ethereum", callback_data=f"pay_net:{plan_id}:eth:{qty}"),
-        types.InlineKeyboardButton("💵 ۴. تتر (USDT) - شبکه اتریوم ERC-20", callback_data=f"pay_net:{plan_id}:usdt_erc20:{qty}"),
+        types.InlineKeyboardButton("💳 ۱. کارت به کارت (انتقال شتابی - تایید آنی) ⚡️", callback_data=f"pay_card:{plan_id}:{qty}"),
+        types.InlineKeyboardButton("🔺 ۲. ترون (TRX) - شبکه Tron ⚡️ (کمترین کارمزد)", callback_data=f"pay_net:{plan_id}:trx:{qty}"),
+        types.InlineKeyboardButton("💵 ۳. تتر (USDT) - شبکه ترون TRC-20", callback_data=f"pay_net:{plan_id}:usdt_trc20:{qty}"),
+        types.InlineKeyboardButton("🔹 ۴. اتریوم (ETH) - شبکه Ethereum", callback_data=f"pay_net:{plan_id}:eth:{qty}"),
+        types.InlineKeyboardButton("💵 ۵. تتر (USDT) - شبکه اتریوم ERC-20", callback_data=f"pay_net:{plan_id}:usdt_erc20:{qty}"),
         types.InlineKeyboardButton("🔙 بازگشت به انتخاب مدت زمان", callback_data=f"buy_vol:{devices}:{volume_gb}")
     )
     try:
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     except Exception:
         send_message_safe(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_card:"))
+def handle_payment_card(call):
+    parts = call.data.split(":")
+    plan_id = parts[1]
+    qty = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+    qty = max(1, min(qty, 10))
+
+    plans = {p["id"]: p for p in get_vip_plans()}
+    plan = plans.get(plan_id)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    if not plan:
+        send_message_safe(call.message.chat.id, "⚠️ پلن مورد نظر یافت نشد.")
+        return
+
+    unit_usd = plan["price_usd"]
+    unit_toman = plan.get("price_toman", 0)
+    total_usd = round(unit_usd * qty, 2)
+    total_toman = unit_toman * qty
+
+    # Customer Club Discount
+    disc = club_manager.calculate_discounted_price(call.from_user.id, total_toman, total_usd)
+    final_toman = disc["final_toman"]
+    final_usd = disc["final_usd"]
+    discount_pct = disc["discount_pct"]
+
+    # 1. Create order
+    order_id = order_mgr.create_order(
+        user_id=call.from_user.id,
+        username=call.from_user.username,
+        first_name=call.from_user.first_name,
+        plan=plan,
+        crypto_network="کارت به کارت (بانک ملی)",
+        crypto_currency="TOMAN/RIAL",
+        crypto_amount=final_toman,
+        quantity=qty,
+        discount_percent=discount_pct,
+        discount_toman=disc["discount_toman"],
+        final_price_toman=final_toman,
+        final_price_usd=final_usd,
+        payment_method="CARD_TO_CARD",
+    )
+
+    # 2. Allocate Unique Rial Suffix (1 to 99 Rials) for collision avoidance
+    alloc = bank_sms_mgr.allocate_unique_rial_amount(order_id, final_toman)
+    total_rials = alloc["total_amount_rials"]
+    suffix = alloc["suffix"]
+
+    # Persist allocated rials and suffix on order
+    with order_mgr._get_connection() as conn:
+        conn.execute(
+            "UPDATE orders SET total_amount_rials = ?, rial_suffix = ? WHERE order_id = ?",
+            (total_rials, suffix, order_id),
+        )
+        conn.commit()
+
+    dur_days = plan.get("duration_days", 30)
+    dur_map = {30: "۱ ماهه", 90: "۳ ماهه", 180: "۶ ماهه"}
+    dur_str = dur_map.get(dur_days, f"{dur_days} روز")
+
+    qty_line = f"🔢 <b>تعداد اشتراک:</b> {qty} عدد\n" if qty > 1 else ""
+    if discount_pct > 0:
+        price_line = (
+            f"▫️ <b>مبلغ پایه:</b> {total_toman:,} تومان\n"
+            f"🎁 <b>تخفیف باشگاه مشتریان ({discount_pct}٪):</b> {disc['discount_toman']:,}- تومان\n"
+            f"💵 <b>مبلغ نهایی پلن:</b> <b>{final_toman:,} تومان</b>\n"
+        )
+    else:
+        price_line = f"💵 <b>مبلغ پلن:</b> <b>{total_toman:,} تومان</b>\n"
+
+    card_text = (
+        f"🧾 <b>فاکتور پرداخت کارت به کارت سفارش <code>{order_id}</code></b>\n\n"
+        f"📦 <b>پلن:</b> {plan.get('volume_gb', 30)} گیگ | {dur_str} ({plan.get('devices', 1)} کاربره)\n"
+        f"{qty_line}"
+        f"{price_line}"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💳 <b>اطلاعات کارت بانکی مقصد:</b>\n"
+        f"▫️ <b>شماره کارت:</b>\n"
+        f"<code>{DESTINATION_CARD_RAW}</code>\n"
+        f"▫️ <b>به نام:</b> <b>{DESTINATION_HOLDER_FA}</b> (بانک ملی)\n"
+        f"<i>(روی شماره کارت ضربه بزنید تا کپی شود)</i>\n\n"
+        f"💰 <b>مبلغ دقیق واریز به ریال (با شناسه اختصاصی):</b>\n"
+        f"<code>{total_rials:,}</code> <b>ریال</b>\n"
+        f"<i>(روی مبلغ ضربه بزنید تا کپی شود)</i>\n"
+        f"<i>معادل {final_toman:,} تومان + {suffix} ریال شناسه</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡️ <b>نکته مهم جهت تایید خودکار و آنی:</b>\n"
+        f"• در همراه بانک یا آپ، مبلغ را <b>دقیقاً به ریال (<code>{total_rials:,}</code> ریال)</b> وارد نمایید تا سیستم تطبیق پیامکی ربات، واریزی شما را در لحظه و بدون نیاز به ادمین تایید کند.\n"
+        f"• پس از واریز، عکس فیش را با دکمه زیر ارسال کنید یا کد پیگیری را ثبت نمایید."
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("📸 ارسال عکس فیش / رسید پرداخت (OCR)", callback_data=f"submit_tx:{order_id}"),
+        types.InlineKeyboardButton("✍️ ثبت دستی کد پیگیری فیش", callback_data=f"manual_receipt:{order_id}"),
+        types.InlineKeyboardButton("🔄 استعلام تایید پیامک بانک", callback_data=f"check_sms_status:{order_id}"),
+        types.InlineKeyboardButton("🔙 بازگشت به جزئیات پلن", callback_data=f"plan_sel:{plan_id}:{qty}"),
+    )
+
+    try:
+        bot.edit_message_text(card_text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        send_message_safe(call.message.chat.id, card_text, reply_markup=markup, parse_mode="HTML")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_net:"))
@@ -3505,6 +3648,186 @@ def cmd_cancel_receipt_upload(message):
         send_message_safe(chat_id, "عملیات فعالی جهت لغو وجود ندارد.")
 
 
+def generate_client_username(order: dict, index: int = 0, total_qty: int = 1) -> str:
+    """Generate clean client email/name for 3X-UI based on customer's Telegram username.
+    Requirement: Configs created must be named with their Telegram username."""
+    raw_username = (order.get("username") or "").strip().lstrip("@")
+    clean = re.sub(r'[^a-zA-Z0-9_]', '', raw_username)
+    if clean:
+        base = clean
+    else:
+        first_name = (order.get("first_name") or "").strip()
+        clean_first = re.sub(r'[^a-zA-Z0-9_]', '', first_name)
+        if clean_first and len(clean_first) >= 3:
+            base = clean_first
+        else:
+            base = f"user_{order.get('user_id', 'client')}"
+
+    if total_qty > 1:
+        return f"{base}_{index + 1}"
+    return base
+
+
+def fulfill_and_deliver_order(order_id: str, auto_matched: bool = False, match_details: Optional[dict] = None) -> Tuple[bool, str]:
+    """Atomically fulfill order on conpanel-bot, replicate to bridges, release suffix,
+    and deliver subscription links to the user via Telegram."""
+    order = order_mgr.get_order(order_id)
+    if not order:
+        return False, "Order not found"
+
+    if order.get("status") == "APPROVED":
+        return True, "Already approved"
+
+    if not order_mgr.start_approving_order(order_id):
+        return False, "Order currently being processed"
+
+    qty = order.get("quantity", 1)
+    delivered_subs = []
+    errors = []
+
+    for i in range(qty):
+        email_tag = generate_client_username(order, index=i, total_qty=qty)
+        creation_res = botpanel_mgr.create_customer_subscription(
+            email=email_tag,
+            total_gb=order["volume_gb"],
+            expiry_days=order["duration_days"],
+            limit_hwid=order.get("devices", 1),
+            tg_id=order["user_id"]
+        )
+        if creation_res.get("success"):
+            delivered_subs.append(creation_res)
+            # Replicate immediately to both domestic bridge panels:
+            # 1. Pars Online Inbound 2 (Bridge 2X)
+            try:
+                freshpanel_mgr.create_customer_subscription(
+                    email=creation_res["email"],
+                    total_gb=order["volume_gb"],
+                    expiry_days=order["duration_days"],
+                    limit_hwid=order.get("devices", 1),
+                    tg_id=order["user_id"],
+                    inbound_id=2,
+                )
+            except Exception as e_sec:
+                logger.warning("Could not immediately replicate client to Pars Online panel: %s", e_sec)
+
+            # 2. Asiatech Inbound 1 (Bridge 2X)
+            try:
+                asiapanel_mgr.create_customer_subscription(
+                    email=creation_res["email"],
+                    total_gb=order["volume_gb"],
+                    expiry_days=order["duration_days"],
+                    limit_hwid=order.get("devices", 1),
+                    tg_id=order["user_id"],
+                    inbound_id=1,
+                )
+            except Exception as e_ter:
+                logger.warning("Could not immediately replicate client to Asiatech panel: %s", e_ter)
+        else:
+            errors.append(creation_res.get("error", "Unknown panel error"))
+
+    if not delivered_subs:
+        order_mgr.cancel_approving_order(order_id)
+        err_msg = "; ".join(errors) or "Unknown panel error"
+        logger.error("Failed to auto-create client for %s: %s", order_id, err_msg)
+        return False, err_msg
+
+    primary_sub = delivered_subs[0].get("bridge_url") or delivered_subs[0]["sub_url"]
+    order_mgr.approve_order(order_id, primary_sub, delivered_subs=delivered_subs)
+    bank_sms_mgr.release_suffix(order_id)
+
+    # Deliver to customer
+    try:
+        qr_bytes = crypto_manager.generate_qr_bytes(primary_sub)
+        qty_title = f"\n🔢 <b>تعداد اشتراک:</b> {qty} عدد" if qty > 1 else ""
+        lines = [
+            f"🎉 <b>سفارش شما با موفقیت تایید و فعال شد!</b>\n",
+            f"🆔 <b>کد پیگیری:</b> <code>{html.escape(order_id)}</code>",
+            f"📦 <b>پلن:</b> {html.escape(str(order['plan_name']))}{qty_title}",
+            f"📊 <b>حجم ترافیک هر اشتراک:</b> {order['volume_gb']} گیگابایت",
+            f"⏳ <b>مدت اعتبار:</b> {order['duration_days']} روز",
+            f"👥 <b>تعداد کاربر مجاز:</b> {order.get('devices', 1)} دستگاه\n",
+        ]
+
+        for idx, sub in enumerate(delivered_subs, 1):
+            num_str = f" شماره {idx}" if qty > 1 else ""
+            lines.append("━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"🔑 <b>اشتراک{num_str} (شناسه کاربری: <code>{html.escape(sub.get('email', ''))}</code>):</b>")
+
+            sub_id = sub.get("subId")
+            if not sub_id and sub.get("sub_url"):
+                sub_id = sub["sub_url"].rstrip("/").split("/")[-1]
+
+            bridge_u = sub.get("bridge_url") or (f"https://{BRIDGE_DOMAIN}/sub/{sub_id}" if sub_id else "")
+            bridge2_u = sub.get("bridge2_url") or (f"https://{BRIDGE2_DOMAIN}/sub/{sub_id}" if sub_id else "")
+            direct_u = sub.get("sub_url", "")
+
+            if bridge_u:
+                bridge_u = bridge_u.replace("bridge.litontheix.ir", BRIDGE_DOMAIN)
+                lines.append(f"⚡ <b>ساب پارس آنلاین (ملی 2X - همراه/ایرانسل):</b>\n<code>{html.escape(bridge_u)}</code>")
+            if bridge2_u:
+                lines.append(f"⚡ <b>ساب آسیاتک (ملی 2X - مسیر کمکی):</b>\n<code>{html.escape(bridge2_u)}</code>")
+            if direct_u:
+                lines.append(f"🌐 <b>ساب مستقیم آلمان (1X با Fragment):</b>\n<code>{html.escape(direct_u)}</code>")
+
+            if sub.get("json_url"):
+                lines.append(f"📱 <b>لینک ساب Sing-box (JSON):</b>\n<code>{html.escape(sub['json_url'])}</code>")
+            if sub.get("bridge_json_url"):
+                lines.append(f"🚀 <b>لینک Sing-box پارس آنلاین:</b>\n<code>{html.escape(sub['bridge_json_url'])}</code>")
+            if sub.get("bridge2_json_url"):
+                lines.append(f"🚀 <b>لینک Sing-box آسیاتک:</b>\n<code>{html.escape(sub['bridge2_json_url'])}</code>")
+
+        lines.append("━━━━━━━━━━━━━━━━━━━\n")
+        lines.append(
+            "💡 <b>راهنمای اتصال و نرم‌افزارهای پیشنهادی:</b>\n"
+            "• <b>برنامه‌های پشتیبانی‌کننده از Sing-box:</b> نرم‌افزارهای مدرن <b>Karing</b> و <b>Hiddify</b> (لینک مخصوص Sing-box را در آن‌ها وارد فرمایید).\n"
+            "• <b>برنامه‌های معمولی:</b> نرم‌افزارهای <b>v2rayNG</b> (اندروید)، <b>Streisand</b> و <b>Shadowrocket</b> (آیفون).\n"
+            "• <b>ساب کمکی (Bridge):</b> در صورت بروز هرگونه اختلال روی اینترنت همراه اول یا ایرانسل، از لینک Bridge کمکی استفاده نمایید.\n\n"
+            "از اعتماد شما به LitixConnect سپاسگزاریم! ❤️"
+        )
+        cust_msg = "\n".join(lines)
+
+        cust_markup = types.InlineKeyboardMarkup(row_width=2)
+        cust_markup.add(
+            types.InlineKeyboardButton("👤 مشاهده در سفارشات من", callback_data=f"view_order:{order_id}"),
+            types.InlineKeyboardButton("📱 بارکد QR", callback_data=f"order_qr:{order_id}"),
+        )
+        cust_markup.add(
+            types.InlineKeyboardButton("❓ راهنمای رفع مشکل ساب", callback_data=f"order_help:{order_id}"),
+            types.InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu:main"),
+        )
+
+        if len(cust_msg) <= 1000:
+            send_photo_safe(order["user_id"], qr_bytes, caption=cust_msg, parse_mode="HTML", reply_markup=cust_markup)
+        else:
+            send_photo_safe(order["user_id"], qr_bytes, caption=f"🎉 سفارش <code>{html.escape(order_id)}</code> با موفقیت فعال شد!", parse_mode="HTML")
+            send_message_safe(order["user_id"], cust_msg, parse_mode="HTML", reply_markup=cust_markup)
+    except Exception as e:
+        logger.error("Failed to deliver subscription to user %s: %s", order["user_id"], e)
+        send_message_safe(order["user_id"], f"✅ کانفیگ شما ساخته شد:\n<code>{html.escape(primary_sub)}</code>", parse_mode="HTML")
+
+    if auto_matched:
+        details = match_details or {}
+        admin_alert = (
+            f"🤖 <b>تایید و صدور خودکار سفارش با تطبیق پیامک بانک!</b>\n\n"
+            f"🆔 <b>شناسه سفارش:</b> <code>{html.escape(order_id)}</code>\n"
+            f"👤 <b>کاربر:</b> @{html.escape(order.get('username') or 'ندارد')} (ID: <code>{order['user_id']}</code>)\n"
+            f"📦 <b>پلن:</b> {html.escape(str(order['plan_name']))}\n"
+            f"💰 <b>مبلغ پرداختی:</b> <code>{details.get('amount_rials', 0):,}</code> ریال\n"
+            f"🔢 <b>کد پیگیری بانک:</b> <code>{details.get('trace_number', '-')}</code>\n"
+            f"🏦 <b>بانک:</b> {details.get('bank_name', 'شتاب')}\n"
+            f"⏰ <b>زمان واریز:</b> {details.get('deposit_time', '-')}\n"
+            f"🔑 <b>نام کلاینت در پنل:</b> <code>{delivered_subs[0].get('email', '')}</code> روی سرور conpanel-bot"
+        )
+        for admin_chat in get_admin_chat_ids():
+            send_message_safe(admin_chat, admin_alert, parse_mode="HTML")
+
+    return True, "OK"
+
+
+# Wire up bank_sms_mgr automatic fulfillment hook
+bank_sms_mgr.set_fulfillment_callback(lambda oid, d: fulfill_and_deliver_order(oid, auto_matched=True, match_details=d))
+
+
 # --- ADMIN ORDER APPROVAL / REJECTION CALLBACKS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_approve:") or call.data.startswith("admin_reject:"))
 def handle_admin_decision(call):
@@ -3549,6 +3872,7 @@ def handle_admin_decision(call):
 
     if action == "admin_reject":
         order_mgr.reject_order(order_id, reason="رد توسط ادمین")
+        bank_sms_mgr.release_suffix(order_id)
         try:
             bot.answer_callback_query(call.id, f"سفارش {order_id} رد شد.")
         except Exception:
@@ -3557,54 +3881,14 @@ def handle_admin_decision(call):
         send_message_safe(call.message.chat.id, f"❌ سفارش <code>{html.escape(order_id)}</code> رد شد.", parse_mode="HTML")
         return
 
-    # admin_approve: acquire atomic approval lock
-    if not order_mgr.start_approving_order(order_id):
-        try:
-            bot.answer_callback_query(call.id, "این سفارش در حال پردازش یا قبلاً تکمیل شده است.", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    qty = order.get("quantity", 1)
+    # admin_approve: fulfill and deliver
     try:
-        bot.answer_callback_query(call.id, f"در حال ایجاد {qty} اشتراک برای {order_id}...")
+        bot.answer_callback_query(call.id, f"در حال ایجاد اشتراک برای {order_id}...")
     except Exception:
         pass
 
-    delivered_subs = []
-    errors = []
-    for i in range(qty):
-        tag_suffix = f"_{i+1}_{secrets.token_hex(2)}" if qty > 1 else ""
-        email_tag = f"tg_{order['user_id']}{tag_suffix}"
-        creation_res = conpanel_mgr.create_customer_subscription(
-            email=email_tag,
-            total_gb=order["volume_gb"],
-            expiry_days=order["duration_days"],
-            limit_hwid=order.get("devices", 1),
-            tg_id=order["user_id"]
-        )
-        if creation_res.get("success"):
-            delivered_subs.append(creation_res)
-            # Replicate immediately to secondary domestic bridge panel Inbound 2 (Bridge 2X)
-            try:
-                freshpanel_mgr.create_customer_subscription(
-                    email=creation_res["email"],
-                    total_gb=order["volume_gb"],
-                    expiry_days=order["duration_days"],
-                    limit_hwid=order.get("devices", 1),
-                    tg_id=order["user_id"],
-                    inbound_id=2,  # Domestic Bridge 2X
-                )
-            except Exception as e_sec:
-                logger.warning("Could not immediately replicate client to secondary panel: %s", e_sec)
-        else:
-            errors.append(creation_res.get("error", "Unknown error"))
-
-    if not delivered_subs:
-        order_mgr.cancel_approving_order(order_id)
-        err_msg = "; ".join(errors) or "Unknown panel error"
-        logger.error("Failed to auto-create client for %s: %s", order_id, err_msg)
-        # Re-attach markup so admin can retry after fixing panel
+    ok, err_msg = fulfill_and_deliver_order(order_id, auto_matched=False)
+    if not ok:
         markup = types.InlineKeyboardMarkup(row_width=2)
         markup.add(
             types.InlineKeyboardButton("🔄 تلاش مجدد برای تایید", callback_data=f"admin_approve:{order_id}"),
@@ -3612,65 +3896,6 @@ def handle_admin_decision(call):
         )
         send_message_safe(call.message.chat.id, f"❌ خطا در ساخت کانفیگ روی سرور برای سفارش <code>{html.escape(order_id)}</code>:\n{html.escape(str(err_msg))}", reply_markup=markup, parse_mode="HTML")
         return
-
-    primary_sub = delivered_subs[0]["sub_url"]
-    order_mgr.approve_order(order_id, primary_sub, delivered_subs=delivered_subs)
-
-    # Deliver to customer
-    try:
-        qr_bytes = crypto_manager.generate_qr_bytes(primary_sub)
-        qty_title = f"\n🔢 <b>تعداد اشتراک:</b> {qty} عدد" if qty > 1 else ""
-        lines = [
-            f"🎉 <b>سفارش شما با موفقیت تایید و فعال شد!</b>\n",
-            f"🆔 <b>کد پیگیری:</b> <code>{html.escape(order_id)}</code>",
-            f"📦 <b>پلن:</b> {html.escape(str(order['plan_name']))}{qty_title}",
-            f"📊 <b>حجم ترافیک هر اشتراک:</b> {order['volume_gb']} گیگابایت",
-            f"⏳ <b>مدت اعتبار:</b> {order['duration_days']} روز",
-            f"👥 <b>تعداد کاربر مجاز:</b> {order.get('devices', 1)} دستگاه\n",
-        ]
-
-        for idx, sub in enumerate(delivered_subs, 1):
-            num_str = f" شماره {idx}" if qty > 1 else ""
-            lines.append("━━━━━━━━━━━━━━━━━━━")
-            lines.append(f"🔑 <b>اشتراک{num_str}:</b>")
-            lines.append(f"🔗 <b>لینک ساب اصلی (Base64):</b>\n<code>{html.escape(sub['sub_url'])}</code>")
-            if sub.get("json_url"):
-                lines.append(f"📱 <b>لینک ساب Sing-box (JSON):</b>\n<code>{html.escape(sub['json_url'])}</code>")
-            bridge_u = sub.get("bridge_url")
-            if bridge_u:
-                bridge_u = bridge_u.replace("bridge.litontheix.ir", BRIDGE_DOMAIN)
-                lines.append(f"🌉 <b>لینک ساب کمکی (Mirror / Bridge):</b>\n<code>{html.escape(bridge_u)}</code>")
-            if sub.get("bridge_json_url"):
-                lines.append(f"🚀 <b>لینک Sing-box کمکی (Bridge JSON):</b>\n<code>{html.escape(sub['bridge_json_url'])}</code>")
-
-        lines.append("━━━━━━━━━━━━━━━━━━━\n")
-        lines.append(
-            "💡 <b>راهنمای اتصال و نرم‌افزارهای پیشنهادی:</b>\n"
-            "• <b>برنامه‌های پشتیبانی‌کننده از Sing-box:</b> نرم‌افزارهای مدرن <b>Karing</b> و <b>Hiddify</b> (لینک مخصوص Sing-box را در آن‌ها وارد فرمایید).\n"
-            "• <b>برنامه‌های معمولی:</b> نرم‌افزارهای <b>v2rayNG</b> (اندروید)، <b>Streisand</b> و <b>Shadowrocket</b> (آیفون).\n"
-            "• <b>ساب کمکی (Bridge):</b> در صورت بروز هرگونه اختلال روی اینترنت همراه اول یا ایرانسل، از لینک Bridge کمکی استفاده نمایید.\n\n"
-            "از اعتماد شما به LitixConnect سپاسگزاریم! ❤️"
-        )
-        cust_msg = "\n".join(lines)
-
-        cust_markup = types.InlineKeyboardMarkup(row_width=2)
-        cust_markup.add(
-            types.InlineKeyboardButton("👤 مشاهده در سفارشات من", callback_data=f"view_order:{order_id}"),
-            types.InlineKeyboardButton("📱 بارکد QR", callback_data=f"order_qr:{order_id}"),
-        )
-        cust_markup.add(
-            types.InlineKeyboardButton("❓ راهنمای رفع مشکل ساب", callback_data=f"order_help:{order_id}"),
-            types.InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu:main"),
-        )
-
-        if len(cust_msg) <= 1000:
-            send_photo_safe(order["user_id"], qr_bytes, caption=cust_msg, parse_mode="HTML", reply_markup=cust_markup)
-        else:
-            send_photo_safe(order["user_id"], qr_bytes, caption=f"🎉 سفارش <code>{html.escape(order_id)}</code> با موفقیت فعال شد!", parse_mode="HTML")
-            send_message_safe(order["user_id"], cust_msg, parse_mode="HTML", reply_markup=cust_markup)
-    except Exception as e:
-        logger.error("Failed to deliver subscription to user %s: %s", order["user_id"], e)
-        send_message_safe(order["user_id"], f"✅ کانفیگ شما ساخته شد:\n<code>{html.escape(primary_sub)}</code>", parse_mode="HTML")
 
     send_message_safe(call.message.chat.id, f"✅ سفارش <code>{html.escape(order_id)}</code> با موفقیت تایید شد و لینک برای کاربر ارسال گردید.", parse_mode="HTML")
 
@@ -3713,25 +3938,81 @@ def handle_payment_receipt_upload(message):
 
     tx_hash = None
     photo_file_id = None
+    extracted_ocr = None
 
     if message.content_type == 'photo':
         photo_file_id = message.photo[-1].file_id
         tx_hash = (message.caption or "ارسالی از طریق عکس رسید").strip()
+        try:
+            bot.send_chat_action(chat_id, 'typing')
+            f_info = bot.get_file(photo_file_id)
+            p_bytes = bot.download_file(f_info.file_path)
+            extracted_ocr = GeminiReceiptOCR.extract_from_image(p_bytes)
+        except Exception as e_ocr:
+            logger.warning("Receipt OCR processing error: %s", e_ocr)
     else:
         tx_hash = message.text.strip()
 
-    order_mgr.submit_payment_proof(order_id, tx_hash=tx_hash, photo_file_id=photo_file_id, user_id=message.from_user.id)
+    # Extract trace code from OCR or manual input
+    trace_val = extracted_ocr.get("trace_number") if extracted_ocr else None
+    if not trace_val and message.content_type == 'text':
+        clean_digits = re.sub(r'\D', '', message.text.strip())
+        if len(clean_digits) >= 4:
+            trace_val = clean_digits
+
+    # Submit receipt to bank SMS matching engine
+    rec_res = bank_sms_mgr.submit_receipt(
+        order_id=order_id,
+        user_id=message.from_user.id,
+        submission_type="OCR" if extracted_ocr else "MANUAL",
+        amount_rials=extracted_ocr.get("amount_rials") if extracted_ocr else order.get("total_amount_rials"),
+        trace_number=trace_val,
+        date_jalali=extracted_ocr.get("date_jalali") if extracted_ocr else None,
+        time_str=extracted_ocr.get("time") if extracted_ocr else None,
+        destination_card=extracted_ocr.get("destination_card") if extracted_ocr else None,
+        destination_name=extracted_ocr.get("destination_name") if extracted_ocr else None,
+        photo_file_id=photo_file_id,
+        ocr_raw=extracted_ocr,
+    )
+
+    order_mgr.submit_payment_proof(
+        order_id,
+        tx_hash=tx_hash,
+        photo_file_id=photo_file_id,
+        user_id=message.from_user.id,
+        trace_number=trace_val,
+    )
     order = order_mgr.get_order(order_id) or order
 
-    # 1. Confirm ONLY to the user (NEVER send admin approval buttons here!)
-    bot.reply_to(
-        message,
-        f"✅ <b>رسید پرداخت شما برای سفارش <code>{html.escape(order_id)}</code> دریافت شد!</b>\n\n"
-        f"اطلاعات پرداخت جهت بررسی و تایید به مدیریت ارسال گردید. "
-        f"به محض تایید، کانفیگ اختصاصی شما به صورت خودکار در همین چت تحویل داده خواهد شد. "
-        f"از صبوری شما سپاسگزاریم! 🙏",
-        parse_mode="HTML"
-    )
+    # If already auto-matched with bank SMS
+    if rec_res.get("matched"):
+        bot.reply_to(
+            message,
+            f"🎉 <b>واریزی شما با تطبیق آنی پیامک بانک تایید گردید!</b>\n"
+            f"کانفیگ اختصاصی شما صادر و ارسال شد. از خرید شما سپاسگزاریم! ❤️",
+            parse_mode="HTML"
+        )
+        return
+
+    # User confirmation message
+    if extracted_ocr:
+        confirm_text = (
+            f"✅ <b>رسید پرداخت شما با هوش مصنوعی آنالیز و دریافت شد:</b>\n\n"
+            f"▫️ <b>کد پیگیری استخراج‌شده:</b> <code>{html.escape(str(trace_val or 'نامشخص'))}</code>\n"
+            f"▫️ <b>مبلغ تشخیص‌داده‌شده:</b> <code>{extracted_ocr.get('amount_rials', 0):,}</code> ریال\n"
+            f"▫️ <b>زمان واریز:</b> {extracted_ocr.get('date_jalali', '')} {extracted_ocr.get('time', '')}\n\n"
+            f"⏳ <b>سیستم در حال انتظار برای پیامک واریز از بانک است</b> (معمولاً ۱ تا ۳ دقیقه).\n"
+            f"به محض دریافت پیامک از بانک، اشتراک شما به صورت کاملاً خودکار در همین چت تحویل داده خواهد شد! 🙏"
+        )
+    else:
+        confirm_text = (
+            f"✅ <b>رسید پرداخت شما برای سفارش <code>{html.escape(order_id)}</code> دریافت شد!</b>\n\n"
+            f"اطلاعات پرداخت ثبت گردید و در صف بررسی و تایید خودکار قرار گرفت. "
+            f"به محض تایید، کانفیگ اختصاصی شما به صورت خودکار در همین چت تحویل داده خواهد شد. "
+            f"از صبوری شما سپاسگزاریم! 🙏"
+        )
+
+    bot.reply_to(message, confirm_text, parse_mode="HTML")
 
     # 2. Dispatch alert STRICTLY and ONLY to verified Admin(s)
     admin_chats = get_admin_chat_ids()
@@ -3758,6 +4039,138 @@ def handle_payment_receipt_upload(message):
 
     if delivered_count == 0:
         logger.critical("⚠️ FAILED TO DELIVER ORDER %s TO ANY ADMIN IN: %s", order_id, admin_chats)
+
+
+# --- MANUAL RECEIPT PROMPT & SMS STATUS CALLBACKS ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("manual_receipt:"))
+def handle_manual_receipt_prompt(call):
+    order_id = call.data.split(":", 1)[1]
+    chat_id = call.message.chat.id
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    order = order_mgr.get_order(order_id)
+    if not order or order.get("user_id") != call.from_user.id:
+        send_message_safe(chat_id, "⚠️ سفارش معتبری یافت نشد.")
+        return
+
+    user_pending_tx_order[chat_id] = {"order_id": order_id, "timestamp": time.time(), "mode": "manual"}
+    prompt_msg = (
+        f"✍️ <b>ثبت دستی مشخصات پرداخت برای سفارش <code>{html.escape(order_id)}</code>:</b>\n\n"
+        f"لطفاً در پاسخ به این پیام، <b>کد پیگیری</b> (یا شماره ارجاع) درج شده در رسید بانکی را ارسال فرمایید:\n"
+        f"<i>(مثال: 87654321)</i>\n\n"
+        f"<i>(جهت لغو، دستور /cancel را ارسال کنید)</i>"
+    )
+    send_message_safe(chat_id, prompt_msg, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("check_sms_status:"))
+def handle_check_sms_status(call):
+    order_id = call.data.split(":", 1)[1]
+    order = order_mgr.get_order(order_id)
+    if not order or order.get("user_id") != call.from_user.id:
+        try:
+            bot.answer_callback_query(call.id, "⚠️ سفارش یافت نشد.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    if order.get("status") == "APPROVED":
+        try:
+            bot.answer_callback_query(call.id, "✅ سفارش قبلاً تایید و فعال شده است!", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Run instant match check
+    match_res = bank_sms_mgr.match_order(order_id)
+    if match_res:
+        try:
+            bot.answer_callback_query(call.id, "🎉 واریزی شما تایید شد! کانفیگ در حال ارسال است...", show_alert=True)
+        except Exception:
+            pass
+    else:
+        try:
+            bot.answer_callback_query(
+                call.id,
+                "⏳ هنوز پیامک واریز با این مبلغ دقیق ریالی از بانک ثبت نشده است.\nمعمولاً ۱ تا ۳ دقیقه زمان می‌برد. همچنین می‌توانید عکس فیش را ارسال نمایید.",
+                show_alert=True
+            )
+        except Exception:
+            pass
+
+
+# --- ADMIN COMMANDS FOR BANK SMS & WEBHOOK GATEWAY ---
+@bot.message_handler(commands=['banksms'])
+def cmd_bank_sms_ingest(message):
+    """Admin command to forward or paste raw bank SMS text directly for instant matching."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ شما دسترسی مدیریت ندارید.")
+        return
+
+    raw_text = message.text.partition(' ')[2].strip()
+    if not raw_text:
+        bot.reply_to(
+            message,
+            "ℹ️ <b>راهنمای ثبت مستقیم پیامک بانک:</b>\n\n"
+            "دستور را به همراه متن کامل پیامک بانک ارسال کنید:\n"
+            "<code>/banksms واریز به 6037701506640355 مبلغ: 4,000,037 ریال پیگیری: 123456</code>\n\n"
+            "یا پیامک بانک را فوروارد کرده و این دستور را روی آن ریپلای کنید.",
+            parse_mode="HTML"
+        )
+        return
+
+    res = bank_sms_mgr.ingest_bank_sms(raw_text, sender="AdminDirect", timestamp=time.time())
+    if not res.get("success"):
+        bot.reply_to(message, f"❌ پیامک شناسایی نشد: {res.get('error')}")
+        return
+
+    matched_oid = res.get("matched_order_id")
+    match_str = f"✅ <b>منطبق با سفارش <code>{matched_oid}</code> و تایید خودکار شد!</b>" if matched_oid else "⏳ در صف تطبیق قرار گرفت (هنوز سفارشی با این مبلغ دقیق ثبت نشده)."
+
+    bot.reply_to(
+        message,
+        f"🏦 <b>پیامک بانک با موفقیت ثبت شد:</b>\n\n"
+        f"▫️ <b>مبلغ:</b> <code>{res.get('amount_rials', 0):,}</code> ریال\n"
+        f"▫️ <b>کد پیگیری:</b> <code>{res.get('trace_number', '-')}</code>\n"
+        f"▫️ <b>وضعیت:</b> {match_str}",
+        parse_mode="HTML"
+    )
+
+
+@bot.message_handler(commands=['bankstatus'])
+def cmd_bank_status(message):
+    """Admin command to check status of Bank SMS Gateway, Webhook, and Active Suffixes."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ شما دسترسی مدیریت ندارید.")
+        return
+
+    with bank_sms_mgr.db._get_connection() as conn:
+        total_sms = conn.execute("SELECT COUNT(*) FROM bank_sms").fetchone()[0]
+        used_sms = conn.execute("SELECT COUNT(*) FROM bank_sms WHERE is_used = 1").fetchone()[0]
+        unused_sms = conn.execute("SELECT COUNT(*) FROM bank_sms WHERE is_used = 0").fetchone()[0]
+        active_suffixes = conn.execute("SELECT COUNT(*) FROM rial_suffixes WHERE is_active = 1").fetchone()[0]
+
+    port_env = os.getenv("PORT", "8080")
+    domain_env = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("PUBLIC_DOMAIN") or f"your-railway-domain.up.railway.app"
+    webhook_url = f"https://{domain_env}/api/sms-webhook?token={WEBHOOK_SECRET_TOKEN}"
+
+    msg = (
+        f"🏦 <b>گزارش درگاه پیامک بانک و کارت به کارت:</b>\n\n"
+        f"▫️ <b>شماره کارت مقصد:</b> <code>{DESTINATION_CARD_RAW}</code>\n"
+        f"▫️ <b>صاحب حساب:</b> {DESTINATION_HOLDER_FA}\n"
+        f"▫️ <b>کل پیامک‌های دریافتی:</b> <b>{total_sms}</b> عدد\n"
+        f"▫️ <b>پیامک‌های استفاده‌شده (تطبیق‌یافته):</b> <b>{used_sms}</b> عدد\n"
+        f"▫️ <b>پیامک‌های آماده تطبیق:</b> <b>{unused_sms}</b> عدد\n"
+        f"▫️ <b>شناسه‌های ریالی فعال (قفل‌شده):</b> <b>{active_suffixes}</b> عدد\n\n"
+        f"🌐 <b>آدرس وب‌هوک گوشی سامسونگ:</b>\n"
+        f"<code>{webhook_url}</code>\n\n"
+        f"🔑 <b>توکن امنیتی وب‌هوک:</b>\n"
+        f"<code>{WEBHOOK_SECRET_TOKEN}</code>"
+    )
+    bot.reply_to(message, msg, parse_mode="HTML")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("country:"))
@@ -3893,6 +4306,11 @@ if __name__ == "__main__":
     # Launch auto-renewal & 2x traffic accounting reminder daemon
     accounting_thread = threading.Thread(target=reminders_and_accounting_daemon_loop, daemon=True, name="AccountingReminderDaemon")
     accounting_thread.start()
+
+    # Launch Bank SMS Webhook Server & Matching Engine Daemon
+    webhook_port = int(os.getenv("PORT", "8080"))
+    start_webhook_server(bank_sms_mgr, port=webhook_port)
+    bank_sms_mgr.start_background_scanner(interval_seconds=30)
 
     logger.info("Resilient Telegram operational routing loop initializing...")
     threading.Thread(target=ensure_xray_binary, daemon=True).start()

@@ -27,23 +27,44 @@ CON_BASE = os.getenv("CONPANEL_URL", DEFAULT_BASE).rstrip("/")
 CON_USER = os.getenv("CONPANEL_USER", DEFAULT_USER)
 CON_PASS = os.getenv("CONPANEL_PASS", DEFAULT_PASS)
 PUBLIC_DOMAIN = os.getenv("CONPANEL_DOMAIN", "conpanel.litontheix.ir")
-BRIDGE_DOMAIN = os.getenv("CONPANEL_BRIDGE_DOMAIN", os.getenv("BRIDGE_DOMAIN", "conpanel.85-10-197-124.nip.io"))
+BRIDGE_DOMAIN = os.getenv("CONPANEL_BRIDGE_DOMAIN", os.getenv("BRIDGE_DOMAIN", "freshbridge.darkube.ir"))
+BRIDGE2_DOMAIN = os.getenv("CONPANEL_BRIDGE2_DOMAIN", "fckassthis.darkube.ir")
 
 # Secondary Panel Config (Domestic freshbridge c13 Cluster)
 SECONDARY_BASE = (os.getenv("FRESHPANEL_URL") or os.getenv("SECONDARY_PANEL_URL") or "https://freshbridge.darkube.ir/panel").rstrip("/")
 SECONDARY_USER = os.getenv("FRESHPANEL_USER") or os.getenv("SECONDARY_PANEL_USER") or "admin"
 SECONDARY_PASS = os.getenv("FRESHPANEL_PASS") or os.getenv("SECONDARY_PANEL_PASS") or "nima1312560"
 
+# Tertiary Panel Config (Domestic Asiatech c11 Cluster)
+TERTIARY_BASE = (os.getenv("ASIAPANEL_URL") or "https://fckassthis.darkube.ir/panel").rstrip("/")
+TERTIARY_USER = os.getenv("ASIAPANEL_USER") or "admin"
+TERTIARY_PASS = os.getenv("ASIAPANEL_PASS") or "nima1312560"
+
+# Bot Panel Config (Dedicated Second German Datacenter c23 Cluster)
+BOT_BASE = (os.getenv("BOTPANEL_URL") or "https://conbot.85-10-197-124.nip.io/b0tAdm1n9Q").rstrip("/")
+BOT_USER = os.getenv("BOTPANEL_USER") or "admin"
+BOT_PASS = os.getenv("BOTPANEL_PASS") or "BotPanel-2026-x9Q"
+BOT_DOMAIN = os.getenv("BOTPANEL_DOMAIN") or "conbot.85-10-197-124.nip.io"
+
+
 
 class ConpanelClient:
     """Production-grade 3X-UI panel API client with resilient connection pooling,
     automatic re-authentication, idempotent provisioning, and lifecycle management."""
 
-    def __init__(self, base_url: str = CON_BASE, username: str = CON_USER, password: str = CON_PASS, name: str = "Primary"):
+    def __init__(
+        self,
+        base_url: str = CON_BASE,
+        username: str = CON_USER,
+        password: str = CON_PASS,
+        name: str = "Primary",
+        public_domain: str = PUBLIC_DOMAIN,
+    ):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
         self.name = name
+        self.public_domain = public_domain
 
         self.session = requests.Session()
         self.session.trust_env = False
@@ -310,11 +331,13 @@ class ConpanelClient:
         limit_hwid: int,
     ) -> Dict[str, Any]:
         """Construct response dictionary containing Base64, Sing-box JSON, Clash, and Bridge mirror links."""
-        sub_url = f"https://{PUBLIC_DOMAIN}/sub/{sub_id}"
-        json_url = f"https://{PUBLIC_DOMAIN}/json/{sub_id}"
-        clash_url = f"https://{PUBLIC_DOMAIN}/clash/{sub_id}"
+        sub_url = f"https://{self.public_domain}/sub/{sub_id}"
+        json_url = f"https://{self.public_domain}/json/{sub_id}"
+        clash_url = f"https://{self.public_domain}/clash/{sub_id}"
         bridge_url = f"https://{BRIDGE_DOMAIN}/sub/{sub_id}"
         bridge_json_url = f"https://{BRIDGE_DOMAIN}/json/{sub_id}"
+        bridge2_url = f"https://{BRIDGE2_DOMAIN}/sub/{sub_id}"
+        bridge2_json_url = f"https://{BRIDGE2_DOMAIN}/json/{sub_id}"
 
         return {
             "success": True,
@@ -326,6 +349,8 @@ class ConpanelClient:
             "clash_url": clash_url,
             "bridge_url": bridge_url,
             "bridge_json_url": bridge_json_url,
+            "bridge2_url": bridge2_url,
+            "bridge2_json_url": bridge2_json_url,
             "total_gb": total_gb,
             "expiry_days": expiry_days,
             "limit_hwid": limit_hwid,
@@ -333,5 +358,7 @@ class ConpanelClient:
 
 
 # Global singleton instances
-conpanel_mgr = ConpanelClient(CON_BASE, CON_USER, CON_PASS, name="Primary-Germany")
-freshpanel_mgr = ConpanelClient(SECONDARY_BASE, SECONDARY_USER, SECONDARY_PASS, name="Secondary-Domestic")
+conpanel_mgr = ConpanelClient(CON_BASE, CON_USER, CON_PASS, name="Primary-Germany", public_domain=PUBLIC_DOMAIN)
+freshpanel_mgr = ConpanelClient(SECONDARY_BASE, SECONDARY_USER, SECONDARY_PASS, name="Secondary-ParsOnline", public_domain=BRIDGE_DOMAIN)
+asiapanel_mgr = ConpanelClient(TERTIARY_BASE, TERTIARY_USER, TERTIARY_PASS, name="Tertiary-Asiatech", public_domain=BRIDGE2_DOMAIN)
+botpanel_mgr = ConpanelClient(BOT_BASE, BOT_USER, BOT_PASS, name="Secondary-Germany-Bot", public_domain=BOT_DOMAIN)

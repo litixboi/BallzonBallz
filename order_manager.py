@@ -83,13 +83,30 @@ class OrderManager:
                         reject_reason TEXT,
                         approving INTEGER DEFAULT 0,
                         multiplier REAL DEFAULT 1.0,
-                        extra_data_json TEXT
+                        extra_data_json TEXT,
+                        payment_method TEXT DEFAULT 'CRYPTO',
+                        total_amount_rials INTEGER DEFAULT 0,
+                        rial_suffix INTEGER DEFAULT 0,
+                        trace_number TEXT
                     );
                     """
                 )
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at);")
+
+                # Dynamic column migrations for existing databases
+                for col, col_type in [
+                    ("payment_method", "TEXT DEFAULT 'CRYPTO'"),
+                    ("total_amount_rials", "INTEGER DEFAULT 0"),
+                    ("rial_suffix", "INTEGER DEFAULT 0"),
+                    ("trace_number", "TEXT"),
+                ]:
+                    try:
+                        conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_type};")
+                    except sqlite3.OperationalError:
+                        pass
+
                 conn.commit()
 
     def _migrate_from_json_if_needed(self):
@@ -225,6 +242,9 @@ class OrderManager:
         discount_toman: int = 0,
         final_price_toman: Optional[int] = None,
         final_price_usd: Optional[float] = None,
+        payment_method: str = "CRYPTO",
+        total_amount_rials: int = 0,
+        rial_suffix: int = 0,
     ) -> str:
         """Atomically create a new pending order and return its order_id."""
         with _lock:
@@ -253,6 +273,10 @@ class OrderManager:
                     extra_data["discount_toman"] = int(discount_toman)
                     extra_data["original_price_toman"] = total_toman
                     extra_data["original_price_usd"] = total_usd
+                if total_amount_rials > 0:
+                    extra_data["total_amount_rials"] = total_amount_rials
+                    extra_data["rial_suffix"] = rial_suffix
+                    extra_data["payment_method"] = payment_method
                 extra_json = json.dumps(extra_data) if extra_data else None
 
                 conn.execute(
@@ -261,8 +285,9 @@ class OrderManager:
                         order_id, user_id, username, first_name, plan_id, plan_name,
                         quantity, volume_gb, duration_days, devices, price_usd, unit_price_usd,
                         price_toman, unit_price_toman, crypto_network, crypto_currency,
-                        crypto_amount, status, created_at, approving, multiplier, extra_data_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                        crypto_amount, status, created_at, approving, multiplier, extra_data_json,
+                        payment_method, total_amount_rials, rial_suffix
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
                     """,
                     (
                         oid,
@@ -286,6 +311,9 @@ class OrderManager:
                         now_str,
                         multiplier,
                         extra_json,
+                        payment_method,
+                        total_amount_rials,
+                        rial_suffix,
                     ),
                 )
                 conn.commit()
@@ -299,6 +327,7 @@ class OrderManager:
         tx_hash: Optional[str] = None,
         photo_file_id: Optional[str] = None,
         user_id: Optional[int] = None,
+        trace_number: Optional[str] = None,
     ) -> bool:
         """Record user's transaction hash or receipt photo and advance to PENDING_VERIFICATION."""
         with _lock:
@@ -323,14 +352,15 @@ class OrderManager:
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 clean_hash = tx_hash.strip() if tx_hash else order.get("tx_hash")
                 clean_photo = photo_file_id if photo_file_id else order.get("photo_file_id")
+                clean_trace = trace_number.strip() if trace_number else order.get("trace_number")
 
                 conn.execute(
                     """
                     UPDATE orders
-                    SET tx_hash = ?, photo_file_id = ?, status = 'PENDING_VERIFICATION', submitted_at = ?
+                    SET tx_hash = ?, photo_file_id = ?, trace_number = ?, status = 'PENDING_VERIFICATION', submitted_at = ?
                     WHERE order_id = ?
                     """,
-                    (clean_hash, clean_photo, now_str, order_id),
+                    (clean_hash, clean_photo, clean_trace, now_str, order_id),
                 )
                 conn.commit()
 
