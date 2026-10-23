@@ -167,7 +167,16 @@ class ConpanelClient:
                 headers=headers,
                 timeout=(5.0, 15.0),
             )
-            return r.status_code == 200 and r.json().get("success", False)
+            if r.status_code == 200 and r.json().get("success", False):
+                obj = r.json().get("obj") or {}
+                if isinstance(obj, dict):
+                    skipped = obj.get("skipped", [])
+                    if skipped:
+                        for sk in skipped:
+                            logger.warning("[%s] Import skipped '%s': %s", self.name, sk.get("email"), sk.get("reason"))
+                    return obj.get("created", 0) > 0 or len(skipped) == 0
+                return True
+            return False
         except Exception as e:
             logger.error("[%s] Error importing clients: %s", self.name, e)
             return False
@@ -223,6 +232,7 @@ class ConpanelClient:
         limit_hwid: int = 1,
         tg_id: Optional[int] = None,
         inbound_id: int = 1,
+        inbound_ids: Optional[List[int]] = None,
         is_renewal: bool = False,
     ) -> Dict[str, Any]:
         """Create or idempotently renew a customer client record in 3X-UI.
@@ -294,11 +304,12 @@ class ConpanelClient:
             "limitHwid": limit_hwid,
         }
 
+        assigned_inbounds = inbound_ids if inbound_ids is not None else ([1, 2] if inbound_id == 1 else [inbound_id])
         import_body = {
             "data": json.dumps([
                 {
                     "client": client_payload,
-                    "inboundIds": [inbound_id],
+                    "inboundIds": assigned_inbounds,
                 }
             ])
         }

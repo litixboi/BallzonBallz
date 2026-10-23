@@ -3,7 +3,9 @@
 .env.*
 !.env.example
 orders.json
-test_integration.py
+orders.db
+test_*
+test_*/**
 __pycache__
 *.pyc
 *.pyo

@@ -227,6 +227,70 @@ class OrderManager:
         t = threading.Thread(target=_export_task, daemon=True, name="OrdersJsonExporter")
         t.start()
 
+    def has_user_claimed_trial(self, user_id: int) -> bool:
+        """Check if a Telegram user has already claimed a free 24-hour trial."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM orders
+                WHERE user_id = ? AND plan_id = 'TRIAL_24H' AND status != 'REJECTED'
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            return row is not None
+
+    def create_trial_order(
+        self,
+        user_id: int,
+        username: Optional[str],
+        first_name: Optional[str],
+        sub_url: str,
+        delivered_subs: List[Dict[str, Any]],
+    ) -> str:
+        """Create and immediately approve an anti-abuse 24-hour free VIP trial order."""
+        with _lock:
+            with self._get_connection() as conn:
+                chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+                while True:
+                    rand_code = "".join(secrets.choice(chars) for _ in range(5))
+                    oid = f"TRL-{rand_code}"
+                    existing = conn.execute("SELECT 1 FROM orders WHERE order_id = ?", (oid,)).fetchone()
+                    if not existing:
+                        break
+
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                subs_json = json.dumps(delivered_subs, ensure_ascii=False)
+
+                conn.execute(
+                    """
+                    INSERT INTO orders (
+                        order_id, user_id, username, first_name, plan_id, plan_name,
+                        quantity, volume_gb, duration_days, devices, price_usd, unit_price_usd,
+                        price_toman, unit_price_toman, crypto_network, crypto_currency,
+                        crypto_amount, status, created_at, submitted_at, resolved_at,
+                        delivered_sub_url, delivered_subs_json, approving, multiplier,
+                        payment_method
+                    ) VALUES (
+                        ?, ?, ?, ?, 'TRIAL_24H', 'تست ۲۴ ساعته رایگان VIP',
+                        1, 1.0, 1, 1, 0.0, 0.0,
+                        0, 0, 'FREE', 'FREE',
+                        0.0, 'APPROVED', ?, ?, ?,
+                        ?, ?, 0, 1.0,
+                        'FREE_TRIAL'
+                    )
+                    """,
+                    (
+                        oid, user_id, username or "", first_name or "",
+                        now_str, now_str, now_str,
+                        sub_url, subs_json,
+                    ),
+                )
+                conn.commit()
+
+        self._export_json_snapshot()
+        return oid
+
     def create_order(
         self,
         user_id: int,

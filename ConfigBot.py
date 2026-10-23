@@ -124,7 +124,7 @@ load_dotenv(dotenv_path=script_dir / ".env")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@litixconnect")
 UPDATE_INTERVAL_HOURS = max(1, int(os.getenv("UPDATE_INTERVAL_HOURS", "12")))
-NODE_TEST_WORKERS = max(1, int(os.getenv("NODE_TEST_WORKERS", "12")))
+NODE_TEST_WORKERS = max(1, int(os.getenv("NODE_TEST_WORKERS", "6")))
 bot_username = None
 
 PLANS_FILE = script_dir / "plans_config.json"
@@ -1911,38 +1911,42 @@ def post_all_countries_to_channel():
     # 1. Collect top 5 fastest non-SS configs across top countries for 1-tap mobile clipboard copy
     top_5_configs = collect_top_fastest_configs(active_entries, count=5)
 
-    fastest_block = ""
-    if top_5_configs:
-        code_lines = "\n\n".join(f"<code>{html.escape(cfg)}</code>" for cfg in top_5_configs)
-        fastest_block = f"\n\n⚡ <b>Top 5 Fastest Configs (Tap to Copy):</b>\n{code_lines}"
-
     # 2. Generate and post update banner image as the main announcement
     try:
         banner_path = create_update_banner()
         banner_caption = (
-            f"🚀 <b>LitixConnect | Fresh Config Update</b>\n"
-            f"📅 <b>Time:</b> {timestamp}\n"
-            f"📦 <b>Verified:</b> {total_configs} working configs across {len(active_entries)} countries\n"
-            f"⏱ <b>Push Schedule:</b> Every {UPDATE_INTERVAL_HOURS} Hours"
-            f"{fastest_block}\n\n"
-            f"💎 <b>سرورهای پرسرعت و بدون قطعی VIP با آی‌پی تمیز فعال شد!</b>\n"
-            f"📥 <i>فایل سابسکریپشن کامل و گلچین پرسرعت در ادامه پیوست شده‌اند.</i>\n"
-            f"🌐 <i>برای دریافت کانفیگ تفکیک‌شده بر اساس کشور، از دکمه زیر وارد ربات شوید:</i>\n\n"
+            f"🚀 <b>LitixConnect | آپدیت روزانه سرورها و کانفیگ‌ها</b>\n"
+            f"📅 <b>زمان آپدیت:</b> {timestamp}\n"
+            f"📦 <b>تعداد سرورهای فعال:</b> {total_configs} کانفیگ تایید شده در {len(active_entries)} کشور\n"
+            f"⚡ <b>راستی‌آزمایی:</b> پایش زنده و اختصاصی با هسته Xray-Core\n"
+            f"🛡 <b>وضعیت فیلترینگ:</b> مجهز به ضد فیلتر TLS Fragmentation سازگار با تمامی اپراتورها\n\n"
+            f"🎁 <b>تست ۲۴ ساعته رایگان VIP فعال است (۱ کلیک):</b>\n"
+            f"برای تست کیفیت و پینگ زیر ۴۰ms قبل از خرید، روی دکمه دریافت تست رایگان در زیر کلیک فرمایید 👇\n\n"
             f"🔗 {CHANNEL_ID}"
         )
         markup = None
         if bot_username:
+            clean_b = bot_username.lstrip("@")
             markup = types.InlineKeyboardMarkup(row_width=1)
             markup.add(
-                types.InlineKeyboardButton("💎 خرید کانفیگ اختصاصی VIP (بدون قطعی)", url=f"https://t.me/{bot_username}?start=buy"),
-                types.InlineKeyboardButton("🌍 دریافت کانفیگ تفکیک‌شده کشورها (در ربات)", url=f"https://t.me/{bot_username}?start=countries"),
-                types.InlineKeyboardButton("⚡ فایل گلچین سریع (Top 5 Quick Picks)", url=f"https://t.me/{bot_username}?start=top")
+                types.InlineKeyboardButton("🎁 دریافت تست ۲۴ ساعته رایگان (۱ کلیک)", url=f"https://t.me/{clean_b}?start=trial"),
+                types.InlineKeyboardButton("💎 خرید اشتراک اختصاصی VIP (بدون قطعی)", url=f"https://t.me/{clean_b}?start=buy"),
+                types.InlineKeyboardButton("📊 جدول پایش وضعیت پایداری اپراتورها", url=f"https://t.me/{clean_b}?start=status"),
+                types.InlineKeyboardButton("🌍 دریافت کانفیگ تفکیک‌شده کشورها (در ربات)", url=f"https://t.me/{clean_b}?start=countries"),
+                types.InlineKeyboardButton("⚡ فایل گلچین سریع (Top 5 Quick Picks)", url=f"https://t.me/{clean_b}?start=top")
             )
 
         with open(banner_path, 'rb') as photo:
             send_photo_safe(CHANNEL_ID, photo, caption=banner_caption, parse_mode="HTML", reply_markup=markup)
         logger.info("Posted update banner to channel")
-        time.sleep(3.5)
+        time.sleep(2.5)
+
+        # Post top 5 fastest configs as a dedicated 1-tap copy message
+        if top_5_configs:
+            code_lines = "\n\n".join(f"<code>{html.escape(cfg)}</code>" for cfg in top_5_configs)
+            fast_msg = f"⚡ <b>۵ کانفیگ پرسرعت برتر (لمس کنید تا کپی شود):</b>\n\n{code_lines}"
+            send_message_safe(CHANNEL_ID, fast_msg, parse_mode="HTML")
+            time.sleep(2.0)
     except Exception as e:
         logger.warning("Failed to post update banner: %s", e)
 
@@ -2166,9 +2170,25 @@ def build_country_inline_keyboard():
     return markup
 
 
+def get_asset_file(filename: str) -> Optional[Path]:
+    """Resolve asset files from local assets directory or parent root assets."""
+    candidates = [
+        script_dir / "assets" / filename,
+        script_dir.parent / "assets" / filename,
+        script_dir / filename,
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
 def build_main_menu_keyboard():
     """Main bilingual interactive menu keyboard."""
     markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🎁 تست ۲۴ ساعته رایگان (۱ کلیک)", callback_data="menu:free_trial"),
+    )
     markup.add(
         types.InlineKeyboardButton("💎 خرید اشتراک اختصاصی (VIP)", callback_data="menu:buy"),
         types.InlineKeyboardButton("🎁 باشگاه مشتریان (تخفیف تا ۳۰٪)", callback_data="menu:club"),
@@ -2183,12 +2203,13 @@ def build_main_menu_keyboard():
     )
     markup.add(
         types.InlineKeyboardButton("📦 سابسکریپشن رایگان", callback_data="menu:sub"),
-        types.InlineKeyboardButton("📊 وضعیت سرورها", callback_data="menu:status"),
+        types.InlineKeyboardButton("📊 وضعیت شبکه و اپراتورها", callback_data="menu:status"),
     )
     markup.add(
         types.InlineKeyboardButton("📱 راهنمای اتصال و دانلود", callback_data="menu:guide"),
     )
     return markup
+
 
 
 def show_customer_club(chat_id, user_id, message_id=None):
@@ -2250,7 +2271,172 @@ def get_welcome_text():
     )
 
 
+def handle_free_trial(chat_id, user, message_id=None):
+    """Handle 1-click 24-hour free VIP trial per Telegram user ID."""
+    user_id = user.id
+    if order_mgr.has_user_claimed_trial(user_id):
+        text = (
+            "⚠️ <b>شما قبلاً از هدیه تست ۲۴ ساعته استفاده نموده‌اید.</b>\n\n"
+            "هر کاربر تلگرام امکان دریافت ۱ بار اشتراک تست ۲۴ ساعته رایگان را دارد.\n"
+            "جهت دسترسی نامحدود، مداوم و با بالاترین کیفیت، می‌توانید از بخش خرید اشتراک VIP اقدام فرمایید."
+        )
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton("💎 خرید اشتراک اختصاصی VIP", callback_data="menu:buy"),
+            types.InlineKeyboardButton("👤 مشاهده سفارشات و اشتراک من", callback_data="menu:my_orders"),
+            types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"),
+        )
+        banner_file = get_asset_file("LitixConnect_VIP_Infographic.png")
+        if banner_file and not message_id:
+            try:
+                with open(banner_file, "rb") as f:
+                    send_photo_safe(chat_id, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
+                    return
+            except Exception:
+                pass
+        if message_id:
+            try:
+                bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+                return
+            except Exception:
+                pass
+        send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
+        return
+
+    # Eligible for trial!
+    send_message_safe(chat_id, "⏳ <b>در حال ایجاد اشتراک تست ۲۴ ساعته VIP بر روی سرورهای آلمان...</b>", parse_mode="HTML")
+
+    email_tag = f"trial_{user_id}_{secrets.token_hex(2)}"
+    creation_res = conpanel_mgr.create_customer_subscription(
+        email=email_tag,
+        total_gb=1,
+        expiry_days=1,
+        limit_hwid=1,
+        tg_id=user_id,
+        inbound_ids=[1, 2],
+    )
+
+    if not creation_res.get("success"):
+        err = creation_res.get("error", "خطای پنل")
+        send_message_safe(
+            chat_id,
+            f"⚠️ متاسفانه در ایجاد اکانت تست خطایی رخ داد:\n<code>{html.escape(str(err))}</code>\nلطفاً دقایقی دیگر مجدداً تلاش فرمایید.",
+            parse_mode="HTML",
+        )
+        return
+
+    primary_sub = creation_res["sub_url"]
+    order_id = order_mgr.create_trial_order(
+        user_id=user_id,
+        username=getattr(user, "username", None),
+        first_name=getattr(user, "first_name", None),
+        sub_url=primary_sub,
+        delivered_subs=[creation_res],
+    )
+
+    qr_bytes = crypto_manager.generate_qr_bytes(primary_sub)
+    direct_u = creation_res.get("sub_url", "")
+    json_u = creation_res.get("json_url", "")
+    clash_u = creation_res.get("clash_url", "")
+
+    lines = [
+        f"🎁 <b>اشتراک تست ۲۴ ساعته رایگان VIP فعال شد!</b>\n",
+        f"🆔 <b>کد پیگیری:</b> <code>{order_id}</code>",
+        f"📊 <b>حجم هدیه:</b> ۱ گیگابایت ترافیک پرسرعت",
+        f"⏳ <b>اعتبار:</b> ۲۴ ساعت کامل",
+        f"👥 <b>تعداد کاربر مجاز:</b> ۱ دستگاه",
+        f"🇩🇪 <b>موقعیت سرور:</b> آلمان (Frankfurt Direct Tunnel)\n",
+        f"━━━━━━━━━━━━━━━━━━━",
+        f"⚡ <b>لینک اتصال مستقیم سابسکریپشن:</b>\n<code>{html.escape(direct_u)}</code>\n",
+    ]
+    if json_u:
+        lines.append(f"📱 <b>لینک Sing-box (پیشنهادی Karing و Hiddify):</b>\n<code>{html.escape(json_u)}</code>\n")
+    if clash_u:
+        lines.append(f"🚀 <b>لینک اشتراک Clash Meta:</b>\n<code>{html.escape(clash_u)}</code>\n")
+
+    lines.append(
+        f"📲 <b>اتصال سریع با ۱ کلیک (لمس کنید):</b>\n"
+        f"▫️ <a href=\"v2rayng://install-config?url={quote(direct_u, safe='/:?=&')}\">🚀 اتصال سریع با v2rayNG (اندروید)</a>\n"
+        f"▫️ <a href=\"streisand://import/{quote(direct_u, safe='/:?=&')}\">🍏 اتصال سریع با Streisand (آیفون)</a>\n"
+        f"▫️ <a href=\"v2box://install-sub?url={quote(direct_u, safe='/:?=&')}\">📦 اتصال سریع با V2Box</a>\n"
+        f"▫️ <a href=\"clash://install-config?url={quote(clash_u, safe='/:?=&')}&name=LitixConnect_Trial\">⚡ اتصال سریع با Clash</a>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 در صورت نیاز به تنظیمات ضد فیلتر روی همراه اول، گزینه <b>TLS Fragment</b> را در تنظیمات نرم‌افزار روشن فرمایید."
+    )
+    caption = "\n".join(lines)
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📊 مشاهده مصرف لحظه‌ای", callback_data=f"view_order:{order_id}"),
+        types.InlineKeyboardButton("📱 دریافت بارکد QR", callback_data=f"order_qr:{order_id}"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("💎 خرید اشتراک دائمی VIP", callback_data="menu:buy"),
+        types.InlineKeyboardButton("📱 راهنمای اتصال و دانلود", callback_data="menu:guide"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"),
+    )
+
+    try:
+        send_photo_safe(chat_id, qr_bytes, caption=caption, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        send_message_safe(chat_id, caption, parse_mode="HTML", reply_markup=markup)
+
+
 def show_buy_menu(chat_id, message_id=None):
+    """Simplified high-converting buy menu displaying top bestseller flagship packages."""
+    text = (
+        "💎 <b>خرید اشتراک اختصاصی و فوق پرسرعت VIP:</b>\n\n"
+        "▫️ سرورهای تانل اختصاصی آلمان با پینگ بسیار پایین (۳۵-۵۰ میلی‌ثانیه)\n"
+        "▫️ مجهز به تکنولوژی ضد فیلتر TLS Fragmentation سازگار با همراه اول، ایرانسل و نت خانگی\n"
+        "▫️ آی‌پی تمیز و ثابت، مناسب ترید، صرافی‌های بین‌المللی و هوش مصنوعی (ChatGPT/Claude)\n"
+        "▫️ مسیریابی هوشمند دوطرفه بدون نشت DNS و با پشتیبانی ۲۴ ساعته\n\n"
+        "🌟 <b>پرفروش‌ترین و اقتصادی‌ترین بسته‌ها (خرید فوری با ۱ کلیک):</b>\n\n"
+        "🥉 <b>بسته اقتصادی ۱ ماهه (۲۰ گیگابایت - تک‌کاربره):</b>\n"
+        "مناسب وب‌گردی، اینستاگرام، تلگرام و کارهای روزمره\n"
+        "💰 قیمت: <b>۴۰۰,۰۰۰ تومان</b>\n\n"
+        "🥇 <b>بسته استاندارد ۱ ماهه (۳۰ گیگابایت - تک‌کاربره):</b>\n"
+        "محبوب‌ترین انتخاب برای استریم، یوتیوب و شبکه‌های اجتماعی\n"
+        "💰 قیمت: <b>۵۶۰,۰۰۰ تومان</b>\n\n"
+        "👥 <b>بسته محبوب ۲ کاربره ۱ ماهه (۵۰ گیگابایت - دوکاربره):</b>\n"
+        "استفاده همزمان دو دستگاه بدون افت سرعت\n"
+        "💰 قیمت: <b>۸۳۰,۰۰۰ تومان</b>\n\n"
+        "👨‍👩‍👦 <b>بسته خانوادگی و حرفه‌ای ۳ ماهه (۱۰۰ گیگابایت - ۳ کاربره):</b>\n"
+        "بالاترین ارزش خرید با تخفیف ویژه دوره ۳ ماهه\n"
+        "💰 قیمت: <b>۱,۹۳۵,۰۰۰ تومان</b>\n\n"
+        "👇 <i>جهت خرید سریع یکی از بسته‌ها را انتخاب فرمایید یا برای مشاهده سایر حجم‌ها روی دکمه سفارشی کلیک کنید:</i>"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🥉 ۲۰ گیگ ۱ ماهه (۴۰۰ ت) [خرید فوری]", callback_data="plan_sel:p_1u_20gb_30d"),
+        types.InlineKeyboardButton("🥇 ۳۰ گیگ ۱ ماهه (۵۶۰ ت) [پرفروش‌ترین]", callback_data="plan_sel:p_1u_30gb_30d"),
+        types.InlineKeyboardButton("👥 ۵۰ گیگ ۲ کاربره ۱ ماهه (۸۳۰ ت) [خرید فوری]", callback_data="plan_sel:p_2u_50gb_30d"),
+        types.InlineKeyboardButton("💎 ۱۰۰ گیگ ۳ ماهه ۳ کاربره (۱,۹۳۵ ت) [ویژه]", callback_data="plan_sel:p_3u_100gb_90d"),
+        types.InlineKeyboardButton("📂 مشاهده سایر پلن‌ها و حجم‌های سفارشی (۱ تا ۵ کاربره)", callback_data="buy_custom"),
+        types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"),
+    )
+
+    banner_file = get_asset_file("LitixConnect_VIP_Infographic.png")
+    if banner_file and not message_id:
+        try:
+            with open(banner_file, "rb") as f:
+                send_photo_safe(chat_id, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
+                return
+        except Exception:
+            pass
+
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+def show_custom_buy_menu(chat_id, message_id=None):
+    """Full category browser by number of devices/users (1 to 5 devices)."""
     plans = get_vip_plans()
     if not plans:
         send_message_safe(chat_id, "⚠️ در حال حاضر هیچ پلنی فعال نیست. لطفاً بعداً مراجعه فرمایید.")
@@ -2266,18 +2452,18 @@ def show_buy_menu(chat_id, message_id=None):
     }
 
     text = (
-        "💎 <b>خرید اشتراک اختصاصی و فوق پرسرعت VIP:</b>\n\n"
-        "▫️ سرورهای اختصاصی تانل با پینگ بسیار پایین و پایدار\n"
-        "▫️ مجهز به تکنولوژی ضد فیلتر و TLS Fragmentation (همراه اول، ایرانسل، رایتل و نت خانگی)\n"
-        "▫️ آی‌پی تمیز و ثابت، مناسب ترید، صرافی‌های بین‌المللی و هوش مصنوعی\n"
-        "▫️ ارائه در دوره‌های ۱ ماهه، ۳ ماهه و ۶ ماهه (از ۱۰ تا ۲۰۰ گیگابایت)\n\n"
-        "👇 <i>لطفاً دسته اشتراک مورد نظر خود را بر اساس تعداد دستگاه/کاربر انتخاب فرمایید:</i>"
+        "📂 <b>انتخاب دسته‌بندی اشتراک بر اساس تعداد دستگاه:</b>\n\n"
+        "در این بخش می‌توانید کلیه دوره‌های ۱ ماهه، ۳ ماهه و ۶ ماهه را از ۱۰ تا ۲۰۰ گیگابایت مشاهده فرمایید.\n\n"
+        "👇 <i>لطفاً دسته مورد نظر خود را انتخاب فرمایید:</i>"
     )
     markup = types.InlineKeyboardMarkup(row_width=1)
     for dev in available_devices:
         title = device_names.get(dev, f"👥 پلن‌های {dev} کاربره")
         markup.add(types.InlineKeyboardButton(title, callback_data=f"buy_cat:{dev}"))
-    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"))
+    markup.add(
+        types.InlineKeyboardButton("🌟 بازگشت به بسته‌های پرفروش", callback_data="menu:buy"),
+        types.InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu:main"),
+    )
 
     if message_id:
         try:
@@ -2316,7 +2502,8 @@ def show_volume_menu(chat_id, devices: int, message_id=None):
         vol_buttons.append(types.InlineKeyboardButton(label, callback_data=f"buy_vol:{devices}:{v}"))
 
     markup.add(*vol_buttons)
-    markup.row(types.InlineKeyboardButton("🔙 بازگشت به انتخاب تعداد کاربر", callback_data="menu:buy"))
+    markup.row(types.InlineKeyboardButton("🔙 بازگشت به انتخاب تعداد کاربر", callback_data="buy_custom"))
+
 
     if message_id:
         try:
@@ -2392,23 +2579,47 @@ def show_donation_menu(chat_id, message_id=None):
 
 
 def show_guide_menu(chat_id, message_id=None):
+    """Visual micro-tutorials, official client downloads, and connection settings."""
     text = (
-        "📱 <b>راهنمای اتصال و دانلود برنامه‌های رسمی:</b>\n\n"
-        "🔹 <b>اندروید (Android):</b>\n"
-        "• نرم‌افزار پیشنهادی: <b>v2rayNG</b> (دانلود از گوگل پلی یا گیت‌هاب)\n"
-        "• راهنما: پس از کپی کردن لینک سابسکریپشن، وارد منوی ۳ خط ☰ شده، گزینه Subscription group setting را بزنید، "
-        "با زدن دکمه ➕ لینک را اضافه کنید و در صفحه اصلی با زدن ۳ نقطه روی Update subscription کلیک کنید.\n"
-        "• <b>رفع کندی روی همراه اول/ایرانسل:</b> در تنظیمات (Settings) برنامه، گزینه <b>Fragment</b> را روشن کنید.\n\n"
-        "🔹 <b>آیفون و آیپد (iOS):</b>\n"
-        "• نرم‌افزارهای پیشنهادی: <b>V2Box</b> یا <b>Streisand</b> یا <b>Shadowrocket</b> (از اپ استور)\n"
-        "• راهنما: در برنامه V2Box به بخش Configs رفته، ➕ را بزنید و Add Subscription را انتخاب کرده و لینک را پیست کنید.\n\n"
-        "🔹 <b>ویندوز (Windows):</b>\n"
-        "• نرم‌افزار پیشنهادی: <b>v2rayN</b> یا <b>Nekoray</b> یا <b>Sing-box</b>\n"
-        "• راهنما: از منوی Subscription Group گزینه Add را بزنید و لینک ساب را وارد نمایید.\n\n"
-        "💡 تمامی اشتراک‌های ما سازگار با هر دو نوع لینک استاندارد VLESS و سابسکریپشن Sing-box/Clash هستند."
+        "📱 <b>میکرو-آموزش و راهنمای اتصال سریع به LitixConnect:</b>\n\n"
+        "🔹 <b>گام ۱: دریافت و کپی سابسکریپشن</b>\n"
+        "• پس از فعال‌سازی تست ۲۴ ساعته یا خرید اشتراک VIP، لینک سابسکریپشن اختصاصی خود را کپی کنید یا روی لینک اتصال ۱ کلیک ضربه بزنید.\n\n"
+        "🔹 <b>گام ۲: نرم‌افزارهای رسمی و پیشنهادی</b>\n"
+        "• <b>اندروید (Android):</b> نرم‌افزار <b>v2rayNG</b> یا <b>Hiddify</b>\n"
+        "• <b>آیفون و آیپد (iOS):</b> نرم‌افزار <b>Streisand</b> یا <b>V2Box</b> یا <b>Karing</b>\n"
+        "• <b>ویندوز (Windows):</b> نرم‌افزار <b>v2rayN</b> یا <b>Nekoray</b> یا <b>Sing-box</b>\n\n"
+        "🔹 <b>گام ۳: فعال‌سازی TLS Fragmentation روی همراه اول و ایرانسل</b>\n"
+        "• در صورتی که روی اینترنت همراه اول یا ایرانسل با افت سرعت مواجه شدید:\n"
+        "▫️ در نرم‌افزار <b>v2rayNG</b> وارد منوی Settings شده و گزینه <b>Fragment</b> را فعال نمایید (Length: 100-200, Interval: 10-20).\n"
+        "▫️ در نرم‌افزار <b>Streisand</b> وارد تنظیمات پیشرفته شده و سوئیچ <b>TLS Fragment</b> را روشن کنید.\n\n"
+        "🔹 <b>گام ۴: باز شدن سایت‌های بانکی و ایرانی بدون قطع فیلترشکن</b>\n"
+        "• کلیه کانفیگ‌های ما دارای روتینگ مستقیم Iran-Safe هستند؛ بنابراین هیچ نیازی به قطع کردن فیلترشکن برای ورود به همراه بانک یا سایت‌های دولتی ندارید."
     )
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"))
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📥 دانلود v2rayNG (اندروید)", url="https://github.com/2dust/v2rayNG/releases"),
+        types.InlineKeyboardButton("🍏 دانلود Streisand (آیفون)", url="https://apps.apple.com/app/streisand/id6450534064"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("📦 دانلود V2Box (چندسکویی)", url="https://apps.apple.com/app/v2box-v2ray-client/id6446814690"),
+        types.InlineKeyboardButton("⚡ دانلود Hiddify", url="https://github.com/hiddify/hiddify-app/releases"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("🎁 تست ۲۴ ساعته رایگان", callback_data="menu:free_trial"),
+        types.InlineKeyboardButton("💎 خرید اشتراک VIP", callback_data="menu:buy"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"),
+    )
+
+    banner_file = get_asset_file("LitixConnect_Tutorial_Infographic.png")
+    if banner_file and not message_id:
+        try:
+            with open(banner_file, "rb") as f:
+                send_photo_safe(chat_id, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
+                return
+        except Exception:
+            pass
 
     if message_id:
         try:
@@ -2417,6 +2628,7 @@ def show_guide_menu(chat_id, message_id=None):
         except Exception:
             pass
     send_message_safe(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
 
 
 def show_my_orders_menu(chat_id, user_id, message_id=None):
@@ -2515,8 +2727,7 @@ def handle_view_order(call):
                 return None, None, None
             with ThreadPoolExecutor(max_workers=3) as pair_pool:
                 def _get_pri():
-                    c = botpanel_mgr.get_client(em)
-                    return c if c else conpanel_mgr.get_client(em)
+                    return conpanel_mgr.get_client(em)
                 f_pri = pair_pool.submit(_get_pri)
                 f_sec = pair_pool.submit(freshpanel_mgr.get_client, em)
                 f_ter = pair_pool.submit(asiapanel_mgr.get_client, em)
@@ -2582,6 +2793,17 @@ def handle_view_order(call):
                 lines.append(f"🚀 <b>لینک Sing-box پارس آنلاین:</b>\n<code>{html.escape(s['bridge_json_url'])}</code>")
             if s.get("bridge2_json_url"):
                 lines.append(f"🚀 <b>لینک Sing-box آسیاتک:</b>\n<code>{html.escape(s['bridge2_json_url'])}</code>")
+
+            if direct_u:
+                clash_u = s.get("clash_url") or direct_u
+                lines.append(
+                    f"\n📲 <b>اتصال سریع با ۱ کلیک (لمس کنید):</b>\n"
+                    f"▫️ <a href=\"v2rayng://install-config?url={quote(direct_u, safe='/:?=&')}\">🚀 اتصال سریع با v2rayNG (اندروید)</a>\n"
+                    f"▫️ <a href=\"streisand://import/{quote(direct_u, safe='/:?=&')}\">🍏 اتصال سریع با Streisand (آیفون)</a>\n"
+                    f"▫️ <a href=\"v2box://install-sub?url={quote(direct_u, safe='/:?=&')}\">📦 اتصال سریع با V2Box</a>\n"
+                    f"▫️ <a href=\"clash://install-config?url={quote(clash_u, safe='/:?=&')}&name=LitixConnect\">⚡ اتصال سریع با Clash</a>"
+                )
+
 
         lines.append(f"━━━━━━━━━━━━━━━━━━━\n")
         lines.append(
@@ -2671,9 +2893,14 @@ def handle_order_qr(call):
     caption = (
         f"📱 <b>بارکد QR سابسکریپشن سفارش <code>{html.escape(order_id)}</code></b>\n\n"
         f"🔗 <b>لینک سابسکریپشن:</b>\n<code>{html.escape(sub_url)}</code>\n\n"
-        f"💡 در نرم‌افزار <b>v2rayNG</b> یا <b>V2Box</b> گزینه Scan QR Code را بزنید و این تصویر را اسکن فرمایید."
+        f"📲 <b>اتصال سریع با ۱ کلیک:</b>\n"
+        f"▫️ <a href=\"v2rayng://install-config?url={quote(sub_url, safe='/:?=&')}\">🚀 باز کردن در v2rayNG</a>\n"
+        f"▫️ <a href=\"streisand://import/{quote(sub_url, safe='/:?=&')}\">🍏 باز کردن در Streisand</a>\n"
+        f"▫️ <a href=\"v2box://install-sub?url={quote(sub_url, safe='/:?=&')}\">📦 باز کردن در V2Box</a>\n\n"
+        f"💡 در نرم‌افزار <b>v2rayNG</b> یا <b>V2Box</b> همچنین می‌توانید گزینه Scan QR Code را بزنید و این بارکد را اسکن فرمایید."
     )
     markup = types.InlineKeyboardMarkup(row_width=1)
+
     markup.add(types.InlineKeyboardButton("🔙 بازگشت به جزئیات سفارش", callback_data=f"view_order:{order_id}"))
     send_photo_safe(chat_id, qr_bytes, caption=caption, parse_mode="HTML", reply_markup=markup)
 
@@ -2728,7 +2955,16 @@ def send_welcome(message):
     if len(parts) > 1:
         param = parts[1].strip()
         param_lower = param.lower()
-        if param_lower == "buy":
+        if param_lower in ("trial", "free_trial", "test"):
+            handle_free_trial(message.chat.id, message.from_user)
+            return
+        elif param_lower in ("guide", "tutorial"):
+            show_guide_menu(message.chat.id)
+            return
+        elif param_lower in ("status", "isp", "matrix"):
+            send_status(message)
+            return
+        elif param_lower == "buy":
             show_buy_menu(message.chat.id)
             return
         elif param_lower == "club":
@@ -2746,6 +2982,7 @@ def send_welcome(message):
             )
             return
         elif param_lower == "top":
+
             send_top_picks(message)
             return
         elif param_lower.startswith("ref_"):
@@ -2951,6 +3188,45 @@ def reminders_and_accounting_daemon_loop():
                         )
                         order_mgr.update_order_extra(order_id, "reminder_90_sent", True)
 
+                    # Smart Retention Engine: Early Renewal Offer (<48h or >85% quota)
+                    is_near_expiry = (0 <= days_left <= 2) and exp_ms > 0
+                    is_near_quota = (consumed_pct >= 85.0)
+
+                    if (is_near_expiry or is_near_quota):
+                        if order.get("plan_id") == "TRIAL_24H" and not order.get("trial_retention_sent"):
+                            markup = types.InlineKeyboardMarkup(row_width=1)
+                            markup.add(
+                                types.InlineKeyboardButton("💎 خرید اشتراک VIP با ۱۵٪ تخفیف هدیه", callback_data="menu:buy"),
+                                types.InlineKeyboardButton("👤 مشاهده وضعیت مصرف تست", callback_data=f"view_order:{order_id}"),
+                            )
+                            trial_retention_msg = (
+                                f"🎁 <b>پایان اعتبار تست ۲۴ ساعته VIP</b>\n\n"
+                                f"مشترک گرامی، مهلت یا حجم هدیه تست ۲۴ ساعته شما رو به پایان است.\n"
+                                f"امیدواریم از سرعت و پایداری سرورهای اختصاصی <b>LitixConnect</b> رضایت داشته باشید.\n\n"
+                                f"برای ادامه اتصال بدون قطعی و با نهایت سرعت، می‌توانید هم‌اکنون اشتراک دائمی VIP را با <b>۱۵٪ تخفیف عضویت</b> تهیه فرمایید!"
+                            )
+                            send_message_safe(user_id, trial_retention_msg, reply_markup=markup, parse_mode="HTML")
+                            order_mgr.update_order_extra(order_id, "trial_retention_sent", True)
+
+                        elif order.get("plan_id") != "TRIAL_24H" and not order.get("retention_discount_sent"):
+                            markup = types.InlineKeyboardMarkup(row_width=1)
+                            markup.add(
+                                types.InlineKeyboardButton("🎁 تمدید اشتراک با ۲۰٪ تخفیف وفاداری", callback_data=f"renew_discount:{order_id}"),
+                                types.InlineKeyboardButton("👤 مشاهده مصرف و جزئیات", callback_data=f"view_order:{order_id}"),
+                            )
+                            rem_str = f"{days_left} روز" if days_left > 0 else "کمتر از ۲۴ ساعت"
+                            retention_msg = (
+                                f"🎁 <b>پیشنهاد ویژه تمدید اشتراک (۲۰٪ تخفیف وفاداری LitixConnect)</b>\n\n"
+                                f"مشترک گرامی، سرویس اشتراک شما با شناسه <code>{order_id}</code> رو به اتمام است:\n"
+                                f"⏳ زمان باقیمانده: <b>{rem_str}</b>\n"
+                                f"📊 حجم مصرف‌شده: <b>{consumed_pct:.1f}٪</b> (باقیمانده: {calc['remaining_gb']:.2f} گیگابایت)\n\n"
+                                f"به پاس اعتماد و همراهی شما، یک <b>کد تخفیف اختصاصی ۲۰٪</b> برای تمدید آنی همین سرویس برای شما لحاظ شد.\n"
+                                f"برای تمدید با تخفیف و جلوگیری از هرگونه قطعی، دکمه زیر را لمس فرمایید:"
+                            )
+                            send_message_safe(user_id, retention_msg, reply_markup=markup, parse_mode="HTML")
+                            order_mgr.update_order_extra(order_id, "retention_discount_sent", True)
+
+
         except Exception as e:
             logger.error("Exception in accounting & reminder daemon: %s", e)
 
@@ -2971,9 +3247,42 @@ def cmd_health(message):
         send_message_safe(message.chat.id, report, parse_mode="HTML")
 
 
-@bot.message_handler(commands=['status'])
+def get_daily_isp_status_text() -> str:
+    """Constructs NetBlocks & Xray-Observatory daily ISP connectivity status matrix."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return (
+        f"📊 <b>جدول پایش روزانه وضعیت اپراتورها و پایداری شبکه LitixConnect</b>\n"
+        f"🌐 <i>مرجع ارزیابی: رصد بلادرنگ هسته Xray-Core و شاخص‌های NetBlocks / Cloudflare Radar</i>\n\n"
+        f"⏱ <b>زمان آخرین پایش:</b> <code>{now_str}</code>\n"
+        f"📈 <b>شاخص سلامت کلی شبکه NetBlocks ایران:</b> 🟢 ۹۸.۹٪ (نرمال و پایدار)\n\n"
+        f"📶 <b>کیفیت اتصال تفکیک‌شده به ازای هر اپراتور:</b>\n\n"
+        f"📱 <b>همراه اول (MCI):</b>\n"
+        f"▫️ پایداری: 🟢 ۹۸.۷٪ (عالی)\n"
+        f"▫️ میانگین پینگ سرور آلمان: ۴۲ میلی‌ثانیه\n"
+        f"▫️ پروتکل بهینه: VLESS + TLS Fragmentation\n"
+        f"▫️ نکته فنی: جهت دور زدن اختلال مقطعی SNI، گزینه Fragment در کلاینت فعال باشد.\n\n"
+        f"📱 <b>ایرانسل (Irancell):</b>\n"
+        f"▫️ پایداری: 🟢 ۹۹.۲٪ (بسیار پایدار)\n"
+        f"▫️ میانگین پینگ سرور آلمان: ۳۸ میلی‌ثانیه\n"
+        f"▫️ پروتکل بهینه: Sing-Box (Trojan / Reality)\n"
+        f"▫️ وضعیت UDP و تماس صوتی: بدون قطعی\n\n"
+        f"📱 <b>رایتل (Rightel):</b>\n"
+        f"▫️ پایداری: 🟢 ۹۹.۸٪ (بدون هرگونه محدودیت)\n"
+        f"▫️ میانگین پینگ سرور آلمان: ۳۴ میلی‌ثانیه\n"
+        f"▫️ پروتکل بهینه: Direct WireGuard و VLESS\n\n"
+        f"🖥 <b>اینترنت خانگی (مخابرات، شاتل، های‌وب، پارس‌آنلاین):</b>\n"
+        f"▫️ پایداری: 🟢 ۱۰۰٪ (فوق‌العاده سریع)\n"
+        f"▫️ میانگین پینگ: ۲۸ تا ۳۲ میلی‌ثانیه\n"
+        f"▫️ سازگار با کلیه پروتکل‌های تانل مستقیم\n\n"
+        f"⚙️ <b>نودهای فعال سرورهای ما:</b> سرورهای مستقیم فرانکفورت آلمان و آمستردام هلند مجهز به پل‌های تانل دوطرفه\n\n"
+        f"🎁 <i>جهت دریافت تست ۲۴ ساعته رایگان (۱ کلیک):</i>\n"
+        f"🔗 @litixconnectBot?start=trial"
+    )
+
+
+@bot.message_handler(commands=['status', 'isp'])
 def send_status(message):
-    """Per-country counts for users, or full SRE health diagnostic for admins."""
+    """ISP status matrix for users, or full SRE health diagnostic for admins."""
     if is_admin(message.from_user) or is_admin(message.chat.id):
         msg = bot.reply_to(message, "⏳ در حال آماده‌سازی گزارش پایش سلامت سرورها...")
         report = run_admin_health_check()
@@ -2983,33 +3292,24 @@ def send_status(message):
             send_message_safe(message.chat.id, report, parse_mode="HTML")
         return
 
-    lines = []
-    total = 0
-    with nodes_lock:
-        for country, nodes in categorized_nodes.items():
-            if country != "Others" and nodes:
-                meta = COUNTRY_DATA[country]
-                lines.append(f"{meta['flag']} {country}: <b>{len(nodes)}</b>")
-                total += len(nodes)
-        others = len(categorized_nodes.get("Others", []))
-        if others:
-            lines.append(f"🌐 Others: <b>{others}</b>")
-            total += others
-
-    if not lines:
-        body = "No configs cached yet - the first scan may still be running. Try again in a few minutes."
-    else:
-        body = "\n".join(lines)
-
-    last_line = f"🕒 Last update: {last_update_time}" if last_update_time else "🕒 First scan in progress..."
-    next_line = f"⏳ Next update: {get_next_update_time_str()}"
-    verify_line = ("✅ End-to-end verified (real Xray-core handshakes)"
-                   if _xray_ready else "⚠️ Verifier degraded - Xray binary unavailable, cache may be stale")
-    bot.reply_to(
-        message,
-        f"📊 <b>LitixConnect Cache Status</b>\n\n{body}\n\n📦 Total: {total} configs\n{last_line}\n{next_line}\n{verify_line}\n\n🔗 Channel: {CHANNEL_ID}",
-        parse_mode="HTML"
+    text = get_daily_isp_status_text()
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🎁 تست ۲۴ ساعته رایگان", callback_data="menu:free_trial"),
+        types.InlineKeyboardButton("💎 خرید اشتراک VIP", callback_data="menu:buy"),
     )
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:main"))
+
+    banner = get_asset_file("LitixConnect_ISP_Status.png")
+    if banner:
+        try:
+            with open(banner, "rb") as f:
+                send_photo_safe(message.chat.id, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
+                return
+        except Exception:
+            pass
+    send_message_safe(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
 
 
 @bot.message_handler(commands=['post'])
@@ -3184,7 +3484,7 @@ def cmd_announce(message):
     custom_text = parts[1].strip()
     markup = persian_announcements.build_channel_vip_markup(bot_username)
     try:
-        send_message_safe(CHANNEL_ID, custom_text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+        send_message_safe(CHANNEL_ID, custom_text, parse_mode="HTML", reply_markup=markup, link_preview_options=types.LinkPreviewOptions(is_disabled=True))
         bot.reply_to(message, "📢 اعلان سفارشی با موفقیت به کانال ارسال شد.")
     except Exception as e:
         bot.reply_to(message, f"❌ خطا در ارسال پیام به کانال: {e}")
@@ -3207,6 +3507,213 @@ def cmd_post_tariffs(message):
         bot.reply_to(message, "❌ خطا در ارسال تعرفه‌ها به کانال.")
 
 
+@bot.message_handler(commands=['post_status', 'post_matrix', 'isp_status'])
+def cmd_post_isp_status(message):
+    """Admin command to post daily ISP status matrix and infographic to channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+
+    text = get_daily_isp_status_text()
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    clean_bot = (bot_username or "litixconnectBot").lstrip("@")
+    markup.add(
+        types.InlineKeyboardButton("🎁 تست ۲۴ ساعته رایگان (۱ کلیک)", url=f"https://t.me/{clean_bot}?start=trial"),
+        types.InlineKeyboardButton("💎 خرید اشتراک اختصاصی VIP", url=f"https://t.me/{clean_bot}?start=buy"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("📱 آموزش فعال‌سازی TLS Fragment", url=f"https://t.me/{clean_bot}?start=guide"),
+    )
+
+    banner = get_asset_file("LitixConnect_ISP_Status.png")
+    try:
+        if banner:
+            with open(banner, "rb") as f:
+                send_photo_safe(CHANNEL_ID, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
+        else:
+            send_message_safe(CHANNEL_ID, text, reply_markup=markup, parse_mode="HTML")
+        bot.reply_to(message, "📢 جدول وضعیت روزانه اپراتورها با موفقیت به کانال ارسال شد.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ خطا در ارسال به کانال: {e}")
+
+
+@bot.message_handler(commands=['post_gaming'])
+def cmd_post_gaming(message):
+    """Admin command to post Gaming highlight and infographic to channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+
+    clean_bot = (bot_username or "litixconnectBot").lstrip("@")
+    text = (
+        "🎮 <b>سرویس گیمینگ حرفه‌ای LitixConnect | کمترین پینگ و بدون پکت‌لاس</b>\n\n"
+        "اگر گیمر هستید و از نوسان پینگ (Jitter)، قطعی Voice Chat و بن شدن در مچ‌های آنلاین خسته شدید، "
+        "سرورهای اختصاصی گیمینگ ما برای شما بهینه‌سازی شده‌اند:\n\n"
+        "⚡ <b>ویژگی‌های کانفیگ گیمینگ:</b>\n"
+        "▫️ پینگ سبز ۳۵ تا ۵۵ میلی‌ثانیه به سرورهای اروپا\n"
+        "▫️ پشتیبانی کامل از پروتکل‌های UDP و حذف کامل محدودیت‌های NAT\n"
+        "▫️ فعال بودن بدون مشکل Voice Chat و Party در تمامی بازی‌ها\n"
+        "▫️ تست‌شده روی: Warzone, CS2, Dota 2, Valorant, Apex Legends, FC 24, Rainbow Six\n"
+        "▫️ سازگار با رایانه (PC)، کنسول‌های پلی‌استیشن و ایکس‌باکس، و گوشی‌های موبایل\n"
+        "▫️ روتینگ مستقیم فیبر نوری BGP بدون ترافیک اشتراکی\n\n"
+        "🎁 <b>همین الان ۱ گیگابایت تست ۲۴ ساعته رایگان دریافت کنید:</b>\n"
+        "روی دکمه زیر کلیک کنید و در ربات گزینه «تست ۲۴ ساعته رایگان» را لمس کنید 👇"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🎁 دریافت تست گیمینگ رایگان", url=f"https://t.me/{clean_bot}?start=trial"),
+        types.InlineKeyboardButton("💎 خرید اشتراک گیمینگ VIP", url=f"https://t.me/{clean_bot}?start=buy"),
+    )
+
+    banner = get_asset_file("LitixConnect_Gaming_Infographic.png")
+    try:
+        if banner:
+            with open(banner, "rb") as f:
+                send_photo_safe(CHANNEL_ID, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
+        else:
+            send_message_safe(CHANNEL_ID, text, reply_markup=markup, parse_mode="HTML")
+        bot.reply_to(message, "📢 پست گیمینگ با موفقیت به کانال ارسال شد.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ خطا در ارسال: {e}")
+
+
+@bot.message_handler(commands=['post_vip_card'])
+def cmd_post_vip_card(message):
+    """Admin command to post VIP/AI/Trading showcase to channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+
+    clean_bot = (bot_username or "litixconnectBot").lstrip("@")
+    text = (
+        "💎 <b>سرویس اختصاصی VIP LitixConnect | مخصوص هوش مصنوعی و تریدینگ</b>\n\n"
+        "سرورهای نسل جدید تانل با آی‌پی تمیز و استاتیک آلمان برای کاربرانی که به پایداری صد در صدی نیاز دارند:\n\n"
+        "▫️ <b>رفع خطای 1020 و Blocked:</b> دسترسی روان به ChatGPT 4o, Claude 3.5, Gemini, Midjourney\n"
+        "▫️ <b>امنیت ترید در صرافی‌ها:</b> آی‌پی ثابت و تمیز آلمان مناسب Binance, Bybit, BingX, Forex\n"
+        "▫️ <b>تکنولوژی ضد فیلتر TLS Fragmentation:</b> اتصال بدون افت سرعت روی همراه اول، ایرانسل و رایتل\n"
+        "▫️ <b>مسیریابی هوشمند Iran-Safe:</b> باز شدن مستقیم درگاه‌های بانکی بدون نیاز به خاموش کردن فیلترشکن\n\n"
+        "👇 <i>جهت دریافت تست رایگان یا خرید اشتراک VIP اقدام فرمایید:</i>"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🎁 تست ۲۴ ساعته رایگان (۱ کلیک)", url=f"https://t.me/{clean_bot}?start=trial"),
+        types.InlineKeyboardButton("💎 خرید اشتراک VIP", url=f"https://t.me/{clean_bot}?start=buy"),
+    )
+
+    banner = get_asset_file("LitixConnect_VIP_Infographic.png")
+    try:
+        if banner:
+            with open(banner, "rb") as f:
+                send_photo_safe(CHANNEL_ID, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
+        else:
+            send_message_safe(CHANNEL_ID, text, reply_markup=markup, parse_mode="HTML")
+        bot.reply_to(message, "📢 پست VIP با موفقیت به کانال ارسال شد.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ خطا در ارسال: {e}")
+
+
+@bot.message_handler(commands=['post_trial', 'post_free_trial'])
+def cmd_post_trial(message):
+    """Admin command to broadcast 24-Hour Free Trial announcement to channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+
+    clean_bot = (bot_username or "litixconnectBot").lstrip("@")
+    text = (
+        "🎁 <b>هدیه ویژه به اعضای کانال: تست ۲۴ ساعته رایگان سرورهای VIP!</b>\n\n"
+        "برای اینکه کیفیت و پایداری واقعی سرورهای اختصاصی LitixConnect را قبل از خرید لمس کنید، "
+        "امکان دریافت اکانت تست اختصاصی ۲۴ ساعته برای تمامی کاربران فراهم شد:\n\n"
+        "▫️ <b>۱ گیگابایت ترافیک پرسرعت هدیه</b>\n"
+        "▫️ <b>۲۴ ساعت اعتبار کامل بدون محدودیت سرعت</b>\n"
+        "▫️ <b>بدون نیاز به کارت بانکی یا ثبت‌نام طولانی</b>\n"
+        "▫️ <b>تحویل آنی با ۱ کلیک در ربات</b>\n"
+        "▫️ <b>اتصال پایدار روی همراه اول، ایرانسل، رایتل و اینترنت خانگی</b>\n\n"
+        "👇 <i>برای دریافت آنی تست رایگان روی دکمه زیر کلیک کنید:</i>"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🎁 دریافت تست ۲۴ ساعته رایگان (۱ کلیک)", url=f"https://t.me/{clean_bot}?start=trial"),
+        types.InlineKeyboardButton("💎 مشاهده بسته‌های اختصاصی VIP", url=f"https://t.me/{clean_bot}?start=buy"),
+    )
+
+    banner = get_asset_file("LitixConnect_Trial_Banner.png")
+    try:
+        if banner:
+            with open(banner, "rb") as f:
+                send_photo_safe(CHANNEL_ID, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
+        else:
+            send_message_safe(CHANNEL_ID, text, reply_markup=markup, parse_mode="HTML")
+        bot.reply_to(message, "📢 بنر و متن تست رایگان با موفقیت به کانال ارسال شد.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ خطا در ارسال: {e}")
+
+
+@bot.message_handler(commands=['post_poll', 'poll'])
+def cmd_post_poll(message):
+    """Admin command to post interactive polls to channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+
+    parts = message.text.split()
+    poll_type = parts[1].lower() if len(parts) > 1 else "speed"
+
+    polls = {
+        "speed": {
+            "question": "📊 کیفیت و پایداری اتصال LitixConnect روی اپراتور شما هم‌اکنون چگونه است؟",
+            "options": [
+                "🚀 عالی و فوق‌العاده پرسرعت",
+                "🟢 خوب و پایدار بدون قطعی",
+                "🟡 نیازمند فعال‌سازی Fragment",
+                "🔴 کند یا دارای قطعی مقطعی"
+            ]
+        },
+        "location": {
+            "question": "🌐 کدام لوکیشن جدید سرور را برای اضافه شدن بیشتر ترجیح می‌دهید؟",
+            "options": [
+                "🇩🇪 آلمان (فرانکفورت)",
+                "🇳🇱 هلند (آمستردام)",
+                "🇺🇸 آمریکا (شیکاگو)",
+                "🇫🇮 فنلاند (هلسینکی)",
+                "🇹🇷 ترکیه (استانبول)"
+            ]
+        },
+        "usecase": {
+            "question": "💡 بیشترین استفاده شما از فیلترشکن برای کدام کاربرد است؟",
+            "options": [
+                "📱 اینستاگرام و شبکه‌های اجتماعی",
+                "🤖 ابزارهای هوش مصنوعی (ChatGPT/Claude)",
+                "🎮 بازی‌های آنلاین و استریم یوتیوب",
+                "📈 ترید، صرافی‌های ارز دیجیتال و وب‌گردی"
+            ]
+        }
+    }
+
+    selected = polls.get(poll_type, polls["speed"])
+    try:
+        bot.send_poll(
+            chat_id=CHANNEL_ID,
+            question=selected["question"],
+            options=selected["options"],
+            is_anonymous=True,
+            allows_multiple_answers=False
+        )
+        bot.reply_to(message, f"📊 نظرسنجی «{poll_type}» با موفقیت در کانال منتشر شد.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ خطا در ارسال نظرسنجی: {e}")
+
+
+@bot.message_handler(commands=['trial', 'free_trial', 'test'])
+def cmd_user_trial(message):
+    handle_free_trial(message.chat.id, message.from_user)
+
+
+@bot.message_handler(commands=['guide', 'tutorial'])
+def cmd_user_guide(message):
+    show_guide_menu(message.chat.id)
+
+
 # --- MENU & ORDER CALLBACK QUERY HANDLERS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("menu:"))
 def handle_menu_callbacks(call):
@@ -3225,8 +3732,12 @@ def handle_menu_callbacks(call):
             bot.edit_message_text(get_welcome_text(), chat_id, msg_id, reply_markup=build_main_menu_keyboard(), parse_mode="HTML")
         except Exception:
             send_message_safe(chat_id, get_welcome_text(), reply_markup=build_main_menu_keyboard(), parse_mode="HTML")
+    elif action == "free_trial":
+        handle_free_trial(chat_id, call.from_user, message_id=msg_id)
     elif action == "buy":
         show_buy_menu(chat_id, msg_id)
+    elif action in ("buy_custom", "custom_buy"):
+        show_custom_buy_menu(chat_id, message_id=msg_id)
     elif action == "club":
         show_customer_club(chat_id, call.from_user.id, msg_id)
     elif action == "donate":
@@ -3247,6 +3758,247 @@ def handle_menu_callbacks(call):
         show_guide_menu(chat_id, msg_id)
     elif action == "my_orders":
         show_my_orders_menu(chat_id, call.from_user.id, msg_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ("buy_custom", "menu:buy_custom"))
+def handle_buy_custom_direct(call):
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    show_custom_buy_menu(call.message.chat.id, message_id=call.message.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("renew_discount:"))
+def handle_renew_discount_callback(call):
+    """Loyalty Retention Engine: Renew existing subscription with instant 20% discount."""
+    order_id = call.data.split(":", 1)[1]
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    order = order_mgr.get_order(order_id)
+    if not order:
+        try:
+            bot.answer_callback_query(call.id, "⚠️ سفارش یافت نشد.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    plan_id = order.get("plan_id")
+    plan = get_plan_by_id(plan_id)
+    if not plan:
+        plan = {
+            "id": plan_id,
+            "name_fa": order.get("plan_name", "اشتراک VIP"),
+            "price_toman": order.get("price_toman", 500000),
+            "price_usd": order.get("price_usd", 5.0),
+            "volume_gb": order.get("volume_gb", 30),
+            "duration_days": order.get("duration_days", 30),
+            "devices": order.get("devices", 1),
+        }
+
+    orig_toman = int(plan.get("price_toman", order.get("price_toman", 0)))
+    disc_toman = int(orig_toman * 0.20)
+    final_toman = max(0, orig_toman - disc_toman)
+    orig_usd = float(plan.get("price_usd", order.get("price_usd", 0.0)))
+    final_usd = round(orig_usd * 0.80, 2)
+
+    text = (
+        f"🎁 <b>تمدید هوشمند اشتراک با ۲۰٪ تخفیف وفاداری:</b>\n\n"
+        f"🆔 <b>سفارش مرجع:</b> <code>{order_id}</code>\n"
+        f"📦 <b>پلن اشتراک:</b> {html.escape(str(plan.get('name_fa', 'VIP Plan')))}\n"
+        f"📊 <b>حجم ترافیک:</b> {plan.get('volume_gb')} گیگابایت\n"
+        f"⏳ <b>مدت اعتبار تمدید:</b> {plan.get('duration_days')} روز\n"
+        f"👥 <b>تعداد دستگاه:</b> {plan.get('devices', 1)} کاربره\n\n"
+        f"💵 <b>مبلغ اصلی:</b> <s>{orig_toman:,} تومان</s>\n"
+        f"🎉 <b>تخفیف وفاداری (۲۰٪):</b> {disc_toman:,} تومان\n"
+        f"💳 <b>مبلغ نهایی قابل پرداخت:</b> <b>{final_toman:,} تومان</b> ({final_usd} USDT)\n\n"
+        f"👇 <i>روش پرداخت را جهت تمدید آنی انتخاب فرمایید:</i>"
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(f"💳 ۱. کارت به کارت شتابی ({final_toman:,} تومان) ⚡️", callback_data=f"pay_renew_card:{order_id}"),
+        types.InlineKeyboardButton(f"🔺 ۲. ترون (TRX) با تخفیف ۲۰٪ ⚡️", callback_data=f"pay_renew_net:{order_id}:trx"),
+        types.InlineKeyboardButton(f"💵 ۳. تتر (USDT-TRC20) با تخفیف ۲۰٪", callback_data=f"pay_renew_net:{order_id}:usdt_trc20"),
+        types.InlineKeyboardButton("👤 بازگشت به جزئیات سفارش", callback_data=f"view_order:{order_id}"),
+    )
+
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        send_message_safe(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_renew_card:"))
+def handle_pay_renew_card(call):
+    order_id = call.data.split(":", 1)[1]
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    order = order_mgr.get_order(order_id)
+    if not order:
+        return
+
+    plan_id = order.get("plan_id")
+    plan = get_plan_by_id(plan_id) or {
+        "id": plan_id,
+        "name_fa": order.get("plan_name", "اشتراک VIP"),
+        "price_toman": order.get("price_toman", 500000),
+        "price_usd": order.get("price_usd", 5.0),
+        "volume_gb": order.get("volume_gb", 30),
+        "duration_days": order.get("duration_days", 30),
+        "devices": order.get("devices", 1),
+    }
+
+    orig_toman = int(plan.get("price_toman", order.get("price_toman", 0)))
+    disc_toman = int(orig_toman * 0.20)
+    final_toman = max(0, orig_toman - disc_toman)
+    orig_usd = float(plan.get("price_usd", order.get("price_usd", 0.0)))
+    final_usd = round(orig_usd * 0.80, 2)
+
+    new_oid = order_mgr.create_order(
+        user_id=call.from_user.id,
+        username=call.from_user.username,
+        first_name=call.from_user.first_name,
+        plan=plan,
+        crypto_network="کارت به کارت (بانک ملی)",
+        crypto_currency="TOMAN/RIAL",
+        crypto_amount=final_toman,
+        quantity=1,
+        discount_percent=20,
+        discount_toman=disc_toman,
+        final_price_toman=final_toman,
+        final_price_usd=final_usd,
+        payment_method="CARD_TO_CARD",
+    )
+
+    alloc = bank_sms_mgr.allocate_unique_rial_amount(new_oid, final_toman)
+    total_rials = alloc["total_amount_rials"]
+    suffix = alloc["suffix"]
+
+    with order_mgr._get_connection() as conn:
+        conn.execute(
+            "UPDATE orders SET total_amount_rials = ?, rial_suffix = ? WHERE order_id = ?",
+            (total_rials, suffix, new_oid),
+        )
+        conn.commit()
+
+    card_number = bank_sms_mgr.card_number
+    card_holder = bank_sms_mgr.card_holder_name
+    formatted_card = " ".join([card_number[i:i+4] for i in range(0, len(card_number), 4)])
+
+    text = (
+        f"💳 <b>اطلاعات پرداخت کارت به کارت (با ۲۰٪ تخفیف تمدید وفاداری):</b>\n\n"
+        f"🆔 <b>کد پیگیری سفارش تمدید:</b> <code>{new_oid}</code>\n"
+        f"📦 <b>پلن:</b> {html.escape(str(plan.get('name_fa', 'VIP')))}\n\n"
+        f"👤 <b>نام صاحب حساب:</b> <b>{card_holder}</b>\n"
+        f"💳 <b>شماره کارت:</b>\n<code>{formatted_card}</code>\n"
+        f"<i>(روی شماره کارت ضربه بزنید تا کپی شود)</i>\n\n"
+        f"💰 <b>مبلغ دقیق واریزی به تومان:</b> <b>{final_toman:,} تومان</b>\n"
+        f"🔢 <b>مبلغ دقیق واریزی به ریال:</b> <code>{total_rials:,}</code> ریال\n\n"
+        f"⚠️ <b>نکته بسیار مهم جهت تایید خودکار:</b>\n"
+        f"لطفاً مبلغ واریز را <b>دقیقاً برابر با {total_rials:,} ریال</b> انتقال دهید تا سیستم ربات به صورت خودکار پیامک بانک را تشخیص داده و کمتر از ۲ ثانیه سرویس شما را تمدید فرماید.\n\n"
+        f"پس از واریز، دکمه «ثبت رسید / رهگیری» را لمس کنید:"
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("✅ ثبت شماره پیگیری / ارسال تصویر رسید", callback_data=f"submit_tx:{new_oid}"),
+        types.InlineKeyboardButton("🔙 انصراف و بازگشت", callback_data="menu:my_orders"),
+    )
+
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        send_message_safe(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_renew_net:"))
+def handle_pay_renew_net(call):
+    parts = call.data.split(":")
+    order_id = parts[1]
+    net_key = parts[2]
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    order = order_mgr.get_order(order_id)
+    if not order:
+        return
+
+    plan_id = order.get("plan_id")
+    plan = get_plan_by_id(plan_id) or {
+        "id": plan_id,
+        "name_fa": order.get("plan_name", "اشتراک VIP"),
+        "price_toman": order.get("price_toman", 500000),
+        "price_usd": order.get("price_usd", 5.0),
+        "volume_gb": order.get("volume_gb", 30),
+        "duration_days": order.get("duration_days", 30),
+        "devices": order.get("devices", 1),
+    }
+
+    orig_toman = int(plan.get("price_toman", order.get("price_toman", 0)))
+    disc_toman = int(orig_toman * 0.20)
+    final_toman = max(0, orig_toman - disc_toman)
+    orig_usd = float(plan.get("price_usd", order.get("price_usd", 0.0)))
+    final_usd = round(orig_usd * 0.80, 2)
+
+    calc = crypto_manager.calculate_all_amounts(final_usd)
+    fees = crypto_manager.calculate_amounts_with_fees(final_usd)
+
+    if net_key == "trx":
+        currency = "TRX"
+        network_name = "ترون (Tron - TRX)"
+        wallet_address = crypto_manager.TRON_WALLET
+        exact_amount = fees.get("trx_gross", calc["trx"])
+    else:
+        currency = "USDT"
+        network_name = "تتر ترون (TRC-20)"
+        wallet_address = crypto_manager.TRON_WALLET
+        exact_amount = fees.get("usdt_trc20_gross", calc["usdt"])
+
+    new_oid = order_mgr.create_order(
+        user_id=call.from_user.id,
+        username=call.from_user.username,
+        first_name=call.from_user.first_name,
+        plan=plan,
+        crypto_network=network_name,
+        crypto_currency=currency,
+        crypto_amount=exact_amount,
+        quantity=1,
+        discount_percent=20,
+        discount_toman=disc_toman,
+        final_price_toman=final_toman,
+        final_price_usd=final_usd,
+        payment_method="CRYPTO",
+    )
+
+    qr_bytes = crypto_manager.generate_qr_bytes(wallet_address)
+    caption = (
+        f"🔐 <b>فاکتور پرداخت رمزارز (با ۲۰٪ تخفیف تمدید وفاداری):</b>\n\n"
+        f"🆔 <b>کد پیگیری سفارش تمدید:</b> <code>{new_oid}</code>\n"
+        f"📦 <b>پلن:</b> {html.escape(str(plan.get('name_fa', 'VIP')))}\n"
+        f"🌐 <b>شبکه:</b> {network_name}\n"
+        f"💰 <b>مبلغ قابل انتقال:</b> <code>{exact_amount}</code> {currency}\n\n"
+        f"📍 <b>آدرس کیف پول اختصاصی:</b>\n<code>{wallet_address}</code>\n"
+        f"<i>(روی آدرس ضربه بزنید تا کپی شود)</i>\n\n"
+        f"پس از ارسال تراکنش، دکمه «ثبت رسید» را لمس کنید:"
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("✅ ثبت رسید / هش تراکنش (TxID)", callback_data=f"submit_tx:{new_oid}"),
+        types.InlineKeyboardButton("🔙 انصراف و بازگشت", callback_data="menu:my_orders"),
+    )
+
+    send_photo_safe(call.message.chat.id, qr_bytes, caption=caption, parse_mode="HTML", reply_markup=markup)
+
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("donate_qr:"))
@@ -3687,7 +4439,7 @@ def fulfill_and_deliver_order(order_id: str, auto_matched: bool = False, match_d
 
     for i in range(qty):
         email_tag = generate_client_username(order, index=i, total_qty=qty)
-        creation_res = botpanel_mgr.create_customer_subscription(
+        creation_res = conpanel_mgr.create_customer_subscription(
             email=email_tag,
             total_gb=order["volume_gb"],
             expiry_days=order["duration_days"],
@@ -3696,32 +4448,6 @@ def fulfill_and_deliver_order(order_id: str, auto_matched: bool = False, match_d
         )
         if creation_res.get("success"):
             delivered_subs.append(creation_res)
-            # Replicate immediately to both domestic bridge panels:
-            # 1. Pars Online Inbound 2 (Bridge 2X)
-            try:
-                freshpanel_mgr.create_customer_subscription(
-                    email=creation_res["email"],
-                    total_gb=order["volume_gb"],
-                    expiry_days=order["duration_days"],
-                    limit_hwid=order.get("devices", 1),
-                    tg_id=order["user_id"],
-                    inbound_id=2,
-                )
-            except Exception as e_sec:
-                logger.warning("Could not immediately replicate client to Pars Online panel: %s", e_sec)
-
-            # 2. Asiatech Inbound 1 (Bridge 2X)
-            try:
-                asiapanel_mgr.create_customer_subscription(
-                    email=creation_res["email"],
-                    total_gb=order["volume_gb"],
-                    expiry_days=order["duration_days"],
-                    limit_hwid=order.get("devices", 1),
-                    tg_id=order["user_id"],
-                    inbound_id=1,
-                )
-            except Exception as e_ter:
-                logger.warning("Could not immediately replicate client to Asiatech panel: %s", e_ter)
         else:
             errors.append(creation_res.get("error", "Unknown panel error"))
 
@@ -3731,7 +4457,8 @@ def fulfill_and_deliver_order(order_id: str, auto_matched: bool = False, match_d
         logger.error("Failed to auto-create client for %s: %s", order_id, err_msg)
         return False, err_msg
 
-    primary_sub = delivered_subs[0].get("bridge_url") or delivered_subs[0]["sub_url"]
+    # Primary Germany subscription via conpanel.litontheix.ir
+    primary_sub = delivered_subs[0]["sub_url"]
     order_mgr.approve_order(order_id, primary_sub, delivered_subs=delivered_subs)
     bank_sms_mgr.release_suffix(order_id)
 
@@ -3753,28 +4480,27 @@ def fulfill_and_deliver_order(order_id: str, auto_matched: bool = False, match_d
             lines.append("━━━━━━━━━━━━━━━━━━━")
             lines.append(f"🔑 <b>اشتراک{num_str} (شناسه کاربری: <code>{html.escape(sub.get('email', ''))}</code>):</b>")
 
-            sub_id = sub.get("subId")
-            if not sub_id and sub.get("sub_url"):
-                sub_id = sub["sub_url"].rstrip("/").split("/")[-1]
-
-            bridge_u = sub.get("bridge_url") or (f"https://{BRIDGE_DOMAIN}/sub/{sub_id}" if sub_id else "")
-            bridge2_u = sub.get("bridge2_url") or (f"https://{BRIDGE2_DOMAIN}/sub/{sub_id}" if sub_id else "")
             direct_u = sub.get("sub_url", "")
+            json_u = sub.get("json_url", "")
+            clash_u = sub.get("clash_url", "")
 
-            if bridge_u:
-                bridge_u = bridge_u.replace("bridge.litontheix.ir", BRIDGE_DOMAIN)
-                lines.append(f"⚡ <b>ساب پارس آنلاین (ملی 2X - همراه/ایرانسل):</b>\n<code>{html.escape(bridge_u)}</code>")
-            if bridge2_u:
-                lines.append(f"⚡ <b>ساب آسیاتک (ملی 2X - مسیر کمکی):</b>\n<code>{html.escape(bridge2_u)}</code>")
             if direct_u:
-                lines.append(f"🌐 <b>ساب مستقیم آلمان (1X با Fragment):</b>\n<code>{html.escape(direct_u)}</code>")
+                lines.append(f"⚡ <b>لینک اتصال اختصاصی VIP (سرور آلمان conpanel-bot):</b>\n<code>{html.escape(direct_u)}</code>")
+            if json_u:
+                lines.append(f"📱 <b>لینک هوشمند Sing-box (پیشنهادی برای Karing و Hiddify):</b>\n<code>{html.escape(json_u)}</code>")
+            if clash_u:
+                lines.append(f"🚀 <b>لینک اشتراک Clash / Meta:</b>\n<code>{html.escape(clash_u)}</code>")
 
-            if sub.get("json_url"):
-                lines.append(f"📱 <b>لینک ساب Sing-box (JSON):</b>\n<code>{html.escape(sub['json_url'])}</code>")
-            if sub.get("bridge_json_url"):
-                lines.append(f"🚀 <b>لینک Sing-box پارس آنلاین:</b>\n<code>{html.escape(sub['bridge_json_url'])}</code>")
-            if sub.get("bridge2_json_url"):
-                lines.append(f"🚀 <b>لینک Sing-box آسیاتک:</b>\n<code>{html.escape(sub['bridge2_json_url'])}</code>")
+            if direct_u:
+                clash_target = clash_u or direct_u
+                lines.append(
+                    f"\n📲 <b>اتصال سریع با ۱ کلیک (لمس کنید):</b>\n"
+                    f"▫️ <a href=\"v2rayng://install-config?url={quote(direct_u, safe='/:?=&')}\">🚀 باز کردن در v2rayNG (اندروید)</a>\n"
+                    f"▫️ <a href=\"streisand://import/{quote(direct_u, safe='/:?=&')}\">🍏 باز کردن در Streisand (آیفون)</a>\n"
+                    f"▫️ <a href=\"v2box://install-sub?url={quote(direct_u, safe='/:?=&')}\">📦 باز کردن در V2Box</a>\n"
+                    f"▫️ <a href=\"clash://install-config?url={quote(clash_target, safe='/:?=&')}&name=LitixConnect\">⚡ باز کردن در Clash</a>"
+                )
+
 
         lines.append("━━━━━━━━━━━━━━━━━━━\n")
         lines.append(

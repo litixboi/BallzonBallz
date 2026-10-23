@@ -33,10 +33,10 @@ class PanelSyncManager:
         alert_callback: Optional[Callable[[str], Any]] = None,
     ):
         if primary is not None or secondary is not None:
-            self.german_panels = [primary] if primary else (german_panels or [conpanel_mgr, botpanel_mgr])
+            self.german_panels = [primary] if primary else (german_panels or [conpanel_mgr])
             self.bridge_panels = [(secondary, secondary_inbound_id)] if secondary else (bridge_panels or [(freshpanel_mgr, 2), (asiapanel_mgr, 1)])
         else:
-            self.german_panels = german_panels or [conpanel_mgr, botpanel_mgr]
+            self.german_panels = german_panels or [conpanel_mgr]
             self.bridge_panels = bridge_panels or [(freshpanel_mgr, 2), (asiapanel_mgr, 1)]
 
         self.alert_callback = alert_callback
@@ -131,12 +131,31 @@ class PanelSyncManager:
                     bridge_by_email = {
                         item["client"]["email"]: item["client"] for item in bridge_items if item.get("client", {}).get("email")
                     }
+                    bridge_by_sub = {
+                        item["client"]["subId"]: item["client"] for item in bridge_items if item.get("client", {}).get("subId")
+                    }
+                    bridge_by_id = {
+                        item["client"]["id"]: item["client"] for item in bridge_items if item.get("client", {}).get("id")
+                    }
                     bridge_stat["total"] = len(bridge_by_email)
 
                     # A. Replicate missing clients into bridge
                     to_import = []
                     for email, m_client in master_by_email.items():
+                        m_sub = m_client.get("subId")
+                        m_id = m_client.get("id")
                         if email not in bridge_by_email:
+                            # If client already exists on bridge under mismatched email (e.g. typo)
+                            existing_match = bridge_by_sub.get(m_sub) or bridge_by_id.get(m_id)
+                            if existing_match:
+                                old_em = existing_match.get("email")
+                                logger.info("[Sync:Rename] Harmonizing client '%s' -> '%s' on %s", old_em, email, bridge_name)
+                                updated_payload = dict(existing_match)
+                                updated_payload["email"] = email
+                                if bridge.update_client(old_em, updated_payload):
+                                    bridge_by_email[email] = updated_payload
+                                continue
+
                             to_import.append({
                                 "client": dict(m_client),
                                 "inboundIds": [inbound_id],
