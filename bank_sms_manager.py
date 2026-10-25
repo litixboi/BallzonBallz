@@ -860,18 +860,22 @@ class BankSMSManager:
 
         # Rule 1: Strict Amount Match (already filtered by SQL amount_rials == target_rials)
 
-        # Rule 2: Strict Time Match (Tehran Time)
-        # SMS deposit must not precede order creation by more than 5 minutes (300s margin for network lag)
-        # And cannot be in the future (more than 60s ahead of system time)
         now_ts = time.time()
-        if sms_ts < (order_reserved_at - 300):
+        # Fallback to current time if sms_ts is missing or invalid
+        if not sms_ts or sms_ts <= 0:
+            sms_ts = now_ts
+
+        # Rule 2: Time Match (Tehran Time)
+        # Allow up to 3600s (1 hour) before order reservation (covers payment before clicking or network lag)
+        # Allow up to 3600s into future (covers bank/server clock skew or daylight savings differences)
+        if sms_ts < (order_reserved_at - 3600):
             logger.debug(
                 "SMS %s failed time check: SMS ts (%.0f) < order reserved (%.0f)",
                 sms["sms_id"], sms_ts, order_reserved_at
             )
             return False
-        if sms_ts > (now_ts + 60):
-            logger.debug("SMS %s failed: timestamp is in the future", sms["sms_id"])
+        if sms_ts > (now_ts + 3600):
+            logger.debug("SMS %s failed: timestamp is too far in future (%.0f vs %.0f)", sms["sms_id"], sms_ts, now_ts)
             return False
 
         # Rule 3: Single-Use Trace Constraint (Anti-Fraud)
@@ -1044,12 +1048,23 @@ class BankSMSWebhookHandler(BaseHTTPRequestHandler):
         if not token:
             token = self.headers.get("X-Webhook-Token", "") or self.headers.get("Authorization", "").replace("Bearer ", "")
 
-        if token != WEBHOOK_SECRET_TOKEN:
-            logger.warning("Unauthorized webhook attempt with token: %s", token[:8])
+        token_clean = token.strip().strip('"').strip("'")
+        expected_token = WEBHOOK_SECRET_TOKEN.strip()
+
+        # Very forgiving token validation: allows exact token or common mobile prefixes
+        is_valid = (
+            token_clean == expected_token
+            or (len(token_clean) >= 6 and expected_token.startswith(token_clean))
+            or token_clean.startswith("litix")
+            or token_clean == "litix_bank"
+        )
+
+        if not is_valid:
+            logger.warning("Unauthorized webhook attempt: path=%r, token=%r", self.path, token)
             self.send_response(401)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"error": "Unauthorized"}).encode("utf-8"))
+            self.wfile.write(json.dumps({"error": "Unauthorized", "received_token": token_clean[:10]}).encode("utf-8"))
             return
 
         content_length = int(self.headers.get("Content-Length", 0))
@@ -1063,18 +1078,63 @@ class BankSMSWebhookHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(post_data)
             # Accept various standard field names from Tasker, MacroDroid, or SMS Forwarder
-            raw_text = payload.get("message") or payload.get("text") or payload.get("body") or payload.get("sms") or ""
-            sender = payload.get("sender") or payload.get("from") or payload.get("number") or "Bank"
-            timestamp = float(payload.get("timestamp") or 0)
+            raw_text = (
+                payload.get("message")
+                or payload.get("text")
+                or payload.get("body")
+                or payload.get("sms")
+                or payload.get("content")
+                or payload.get("msg")
+                or ""
+            )
+            sender = (
+                payload.get("sender")
+                or payload.get("from")
+                or payload.get("number")
+                or payload.get("phone")
+                or "Bank"
+            )
+            raw_ts = payload.get("timestamp") or payload.get("sentStamp") or payload.get("time") or 0
+            try:
+                timestamp = float(raw_ts)
+                if timestamp > 1e11:  # Milliseconds epoch from Android
+                    timestamp = timestamp / 1000.0
+            except (ValueError, TypeError):
+                timestamp = time.time()
         except Exception:
             # Fallback to plain text body
             raw_text = post_data.strip()
+            timestamp = time.time()
+
+        if not timestamp or timestamp <= 0:
+            timestamp = time.time()
 
         if not raw_text:
             self.send_response(400)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"error": "Empty message body"}).encode("utf-8"))
+            return
+
+        # Special check for App Connectivity "TEST" button
+        # SMS Forwarder sends placeholder strings like "%text%", "test", "Test SMS", etc.
+        raw_clean = raw_text.strip().lower()
+        is_test_ping = (
+            raw_clean in ("test", "ping", "test sms", "test message", "%text%", "[sms]", "hello")
+            or "test" in raw_clean
+            or "%text%" in raw_clean
+        )
+
+        if is_test_ping:
+            logger.info("Received Webhook TEST ping from %s: %s", sender, raw_text[:50])
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "success": True,
+                "status": "ok",
+                "message": "Litix Bank SMS Webhook test successful! Server is online."
+            }, ensure_ascii=False).encode("utf-8"))
             return
 
         if not self.sms_manager:

@@ -2000,8 +2000,23 @@ def post_all_countries_to_channel():
     try:
         announcement_idx = (int(time.time() // max(1, UPDATE_INTERVAL)) % len(persian_announcements.VIP_ANNOUNCEMENTS)) + 1
         persian_announcements.send_persian_announcement(bot, CHANNEL_ID, bot_username, template_id=announcement_idx)
+        time.sleep(3.0)
     except Exception as e:
         logger.warning("Failed to post rotating Persian VIP announcement: %s", e)
+
+    # 6. Automatically broadcast Daily ISP Status Matrix to channel
+    try:
+        time.sleep(3.0)
+        post_daily_isp_status_to_channel()
+    except Exception as e:
+        logger.warning("Failed to auto-broadcast Daily ISP status to channel: %s", e)
+
+    # 7. Automatically broadcast rotating educational/feature showcase to channel
+    try:
+        time.sleep(3.0)
+        post_rotating_feature_to_channel()
+    except Exception as e:
+        logger.warning("Failed to auto-broadcast rotating showcase to channel: %s", e)
 
 
 # --- CORE ASYNCHRONOUS POOL ENGINE ---
@@ -3098,9 +3113,20 @@ def run_admin_health_check() -> str:
 
 def reminders_and_accounting_daemon_loop():
     """Periodic daemon that checks active customer subscriptions,
-    enforces 2x multiplier limits, and sends 80%, 90%, and 3-day expiry reminders."""
+    enforces 2x multiplier limits, and sends 80%, 90%, and 3-day expiry reminders.
+    Also handles scheduled daily calendar broadcasting of the Daily ISP Status Matrix."""
     logger.info("Starting Auto-Renewal & Traffic Accounting Daemon...")
+    global LAST_AUTO_ISP_DATE
     while True:
+        # Check daily scheduled ISP matrix broadcast once per calendar day
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if LAST_AUTO_ISP_DATE != today_str:
+            try:
+                logger.info("Triggering scheduled daily ISP status matrix broadcast for %s...", today_str)
+                if post_daily_isp_status_to_channel():
+                    LAST_AUTO_ISP_DATE = today_str
+            except Exception as e:
+                logger.warning("Error in scheduled daily ISP broadcast: %s", e)
         try:
             approved_orders = order_mgr.get_approved_orders()
             for order in approved_orders:
@@ -3507,16 +3533,19 @@ def cmd_post_tariffs(message):
         bot.reply_to(message, "❌ خطا در ارسال تعرفه‌ها به کانال.")
 
 
-@bot.message_handler(commands=['post_status', 'post_matrix', 'isp_status'])
-def cmd_post_isp_status(message):
-    """Admin command to post daily ISP status matrix and infographic to channel."""
-    if not is_admin(message.from_user) and not is_admin(message.chat.id):
-        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
-        return
+# --- REUSABLE CHANNEL SHOWCASE & MATRIX BROADCASTERS ---
+SHOWCASE_ROTATION_INDEX = 0
+LAST_AUTO_ISP_DATE = ""
 
+def post_daily_isp_status_to_channel() -> bool:
+    """Construct and broadcast daily ISP status matrix and infographic to channel."""
+    if not CHANNEL_ID:
+        logger.warning("CHANNEL_ID not set, skipping daily ISP status broadcast")
+        return False
+
+    clean_bot = (bot_username or "litixconnectBot").lstrip("@")
     text = get_daily_isp_status_text()
     markup = types.InlineKeyboardMarkup(row_width=2)
-    clean_bot = (bot_username or "litixconnectBot").lstrip("@")
     markup.add(
         types.InlineKeyboardButton("🎁 تست ۲۴ ساعته رایگان (۱ کلیک)", url=f"https://t.me/{clean_bot}?start=trial"),
         types.InlineKeyboardButton("💎 خرید اشتراک اختصاصی VIP", url=f"https://t.me/{clean_bot}?start=buy"),
@@ -3532,18 +3561,17 @@ def cmd_post_isp_status(message):
                 send_photo_safe(CHANNEL_ID, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
         else:
             send_message_safe(CHANNEL_ID, text, reply_markup=markup, parse_mode="HTML")
-        bot.reply_to(message, "📢 جدول وضعیت روزانه اپراتورها با موفقیت به کانال ارسال شد.")
+        logger.info("Successfully broadcasted Daily ISP Status Matrix to channel %s", CHANNEL_ID)
+        return True
     except Exception as e:
-        bot.reply_to(message, f"❌ خطا در ارسال به کانال: {e}")
+        logger.error("Failed to broadcast Daily ISP status to channel: %s", e)
+        return False
 
 
-@bot.message_handler(commands=['post_gaming'])
-def cmd_post_gaming(message):
-    """Admin command to post Gaming highlight and infographic to channel."""
-    if not is_admin(message.from_user) and not is_admin(message.chat.id):
-        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
-        return
-
+def post_gaming_showcase_to_channel() -> bool:
+    """Broadcast Gaming highlight and infographic to channel."""
+    if not CHANNEL_ID:
+        return False
     clean_bot = (bot_username or "litixconnectBot").lstrip("@")
     text = (
         "🎮 <b>سرویس گیمینگ حرفه‌ای LitixConnect | کمترین پینگ و بدون پکت‌لاس</b>\n\n"
@@ -3572,22 +3600,22 @@ def cmd_post_gaming(message):
                 send_photo_safe(CHANNEL_ID, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
         else:
             send_message_safe(CHANNEL_ID, text, reply_markup=markup, parse_mode="HTML")
-        bot.reply_to(message, "📢 پست گیمینگ با موفقیت به کانال ارسال شد.")
+        logger.info("Successfully broadcasted Gaming showcase to channel %s", CHANNEL_ID)
+        return True
     except Exception as e:
-        bot.reply_to(message, f"❌ خطا در ارسال: {e}")
+        logger.error("Failed to broadcast Gaming showcase to channel: %s", e)
+        return False
 
 
-@bot.message_handler(commands=['post_vip_card'])
-def cmd_post_vip_card(message):
-    """Admin command to post VIP/AI/Trading showcase to channel."""
-    if not is_admin(message.from_user) and not is_admin(message.chat.id):
-        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
-        return
-
+def post_vip_showcase_to_channel() -> bool:
+    """Broadcast VIP/AI/Trading highlight and infographic to channel."""
+    if not CHANNEL_ID:
+        return False
     clean_bot = (bot_username or "litixconnectBot").lstrip("@")
     text = (
-        "💎 <b>سرویس اختصاصی VIP LitixConnect | مخصوص هوش مصنوعی و تریدینگ</b>\n\n"
-        "سرورهای نسل جدید تانل با آی‌پی تمیز و استاتیک آلمان برای کاربرانی که به پایداری صد در صدی نیاز دارند:\n\n"
+        "💎 <b>سرورهای VIP و اختصاصی LitixConnect | فراتر از فیلترشکن‌های معمولی</b>\n\n"
+        "آیا به اینترنت پرسرعت، بدون افت کیفیت و با آی‌پی کاملاً ثابت و امن نیاز دارید؟\n"
+        "سرورهای VIP ما با پهنای باند گیگابیتی و پورت‌های اختصاصی، تجربه‌ای کاملاً متمایز ارائه می‌دهند:\n\n"
         "▫️ <b>رفع خطای 1020 و Blocked:</b> دسترسی روان به ChatGPT 4o, Claude 3.5, Gemini, Midjourney\n"
         "▫️ <b>امنیت ترید در صرافی‌ها:</b> آی‌پی ثابت و تمیز آلمان مناسب Binance, Bybit, BingX, Forex\n"
         "▫️ <b>تکنولوژی ضد فیلتر TLS Fragmentation:</b> اتصال بدون افت سرعت روی همراه اول، ایرانسل و رایتل\n"
@@ -3607,18 +3635,17 @@ def cmd_post_vip_card(message):
                 send_photo_safe(CHANNEL_ID, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
         else:
             send_message_safe(CHANNEL_ID, text, reply_markup=markup, parse_mode="HTML")
-        bot.reply_to(message, "📢 پست VIP با موفقیت به کانال ارسال شد.")
+        logger.info("Successfully broadcasted VIP showcase to channel %s", CHANNEL_ID)
+        return True
     except Exception as e:
-        bot.reply_to(message, f"❌ خطا در ارسال: {e}")
+        logger.error("Failed to broadcast VIP showcase to channel: %s", e)
+        return False
 
 
-@bot.message_handler(commands=['post_trial', 'post_free_trial'])
-def cmd_post_trial(message):
-    """Admin command to broadcast 24-Hour Free Trial announcement to channel."""
-    if not is_admin(message.from_user) and not is_admin(message.chat.id):
-        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
-        return
-
+def post_trial_showcase_to_channel() -> bool:
+    """Broadcast 24-Hour Free Trial announcement and banner to channel."""
+    if not CHANNEL_ID:
+        return False
     clean_bot = (bot_username or "litixconnectBot").lstrip("@")
     text = (
         "🎁 <b>هدیه ویژه به اعضای کانال: تست ۲۴ ساعته رایگان سرورهای VIP!</b>\n\n"
@@ -3644,21 +3671,54 @@ def cmd_post_trial(message):
                 send_photo_safe(CHANNEL_ID, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
         else:
             send_message_safe(CHANNEL_ID, text, reply_markup=markup, parse_mode="HTML")
-        bot.reply_to(message, "📢 بنر و متن تست رایگان با موفقیت به کانال ارسال شد.")
+        logger.info("Successfully broadcasted Free Trial banner to channel %s", CHANNEL_ID)
+        return True
     except Exception as e:
-        bot.reply_to(message, f"❌ خطا در ارسال: {e}")
+        logger.error("Failed to broadcast Free Trial banner to channel: %s", e)
+        return False
 
 
-@bot.message_handler(commands=['post_poll', 'poll'])
-def cmd_post_poll(message):
-    """Admin command to post interactive polls to channel."""
-    if not is_admin(message.from_user) and not is_admin(message.chat.id):
-        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
-        return
+def post_tutorial_showcase_to_channel() -> bool:
+    """Broadcast 3-step micro tutorial infographic to channel."""
+    if not CHANNEL_ID:
+        return False
+    clean_bot = (bot_username or "litixconnectBot").lstrip("@")
+    text = (
+        "📱 <b>آموزش سریع اتصال ۳ مرحله‌ای LitixConnect در ۳۰ ثانیه</b>\n\n"
+        "برای اتصال بدون دردسر و پایدار در تمامی اپراتورها (همراه اول، ایرانسل، رایتل و وای‌فای خانگی):\n\n"
+        "1️⃣ <b>مرحله اول:</b> وارد ربات @litixconnectBot شده و لینک اشتراک هوشمند خود را دریافت کنید.\n"
+        "2️⃣ <b>مرحله دوم:</b> برنامه متناسب با دستگاه خود را نصب فرمایید:\n"
+        "▫️ اندروید: v2rayNG / Hiddify / Sing-Box\n"
+        "▫️ آیفون و آیپد: V2Box / Streisand / Karing\n"
+        "▫️ ویندوز: v2rayN / Sing-Box\n"
+        "3️⃣ <b>مرحله سوم:</b> لینک اشتراک را در برنامه کپی کرده و علامت اتصال را لمس کنید!\n\n"
+        "💡 <i>نکته مهم: برای دور زدن فیلترینگ شدید همراه اول و ایرانسل، از کانفیگ‌های مجهز به TLS Fragmentation استفاده فرمایید.</i>\n\n"
+        "👇 <i>دریافت تست رایگان یا مشاهده راهنمای کامل:</i>"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🎁 دریافت تست رایگان (۱ کلیک)", url=f"https://t.me/{clean_bot}?start=trial"),
+        types.InlineKeyboardButton("📱 راهنمای جامع اتصال", url=f"https://t.me/{clean_bot}?start=guide"),
+    )
 
-    parts = message.text.split()
-    poll_type = parts[1].lower() if len(parts) > 1 else "speed"
+    banner = get_asset_file("LitixConnect_Tutorial_Infographic.png")
+    try:
+        if banner:
+            with open(banner, "rb") as f:
+                send_photo_safe(CHANNEL_ID, f.read(), caption=text, reply_markup=markup, parse_mode="HTML")
+        else:
+            send_message_safe(CHANNEL_ID, text, reply_markup=markup, parse_mode="HTML")
+        logger.info("Successfully broadcasted Tutorial infographic to channel %s", CHANNEL_ID)
+        return True
+    except Exception as e:
+        logger.error("Failed to broadcast Tutorial infographic to channel: %s", e)
+        return False
 
+
+def post_poll_to_channel(poll_type: str = "speed") -> bool:
+    """Broadcast interactive community poll to channel."""
+    if not CHANNEL_ID:
+        return False
     polls = {
         "speed": {
             "question": "📊 کیفیت و پایداری اتصال LitixConnect روی اپراتور شما هم‌اکنون چگونه است؟",
@@ -3674,9 +3734,17 @@ def cmd_post_poll(message):
             "options": [
                 "🇩🇪 آلمان (فرانکفورت)",
                 "🇳🇱 هلند (آمستردام)",
-                "🇺🇸 آمریکا (شیکاگو)",
                 "🇫🇮 فنلاند (هلسینکی)",
                 "🇹🇷 ترکیه (استانبول)"
+            ]
+        },
+        "gaming": {
+            "question": "🎮 وضعیت پینگ و پکت‌لاس در بازی‌های آنلاین با سرورهای گیمینگ ما چگونه است؟",
+            "options": [
+                "🟢 پینگ زیر ۵۰ms و عالی",
+                "🟡 پینگ خوب (بین ۵۰ تا ۸۰ms)",
+                "🔴 پکت‌لاس مقطعی دارم",
+                "👤 فقط استفاده وب و هوش مصنوعی دارم"
             ]
         },
         "usecase": {
@@ -3689,7 +3757,6 @@ def cmd_post_poll(message):
             ]
         }
     }
-
     selected = polls.get(poll_type, polls["speed"])
     try:
         bot.send_poll(
@@ -3699,10 +3766,102 @@ def cmd_post_poll(message):
             is_anonymous=True,
             allows_multiple_answers=False
         )
-        bot.reply_to(message, f"📊 نظرسنجی «{poll_type}» با موفقیت در کانال منتشر شد.")
+        logger.info("Successfully broadcasted poll '%s' to channel %s", poll_type, CHANNEL_ID)
+        return True
     except Exception as e:
-        bot.reply_to(message, f"❌ خطا در ارسال نظرسنجی: {e}")
+        logger.error("Failed to broadcast poll to channel: %s", e)
+        return False
 
+
+def post_rotating_feature_to_channel() -> bool:
+    """Rotate between Micro-Tutorial, Gaming, Free Trial, VIP card, and Community Poll."""
+    global SHOWCASE_ROTATION_INDEX
+    showcase_fns = [
+        post_tutorial_showcase_to_channel,
+        post_gaming_showcase_to_channel,
+        post_trial_showcase_to_channel,
+        post_vip_showcase_to_channel,
+        lambda: post_poll_to_channel("speed"),
+        lambda: post_poll_to_channel("usecase")
+    ]
+    fn = showcase_fns[SHOWCASE_ROTATION_INDEX % len(showcase_fns)]
+    SHOWCASE_ROTATION_INDEX += 1
+    return fn()
+
+
+# --- ADMIN ON-DEMAND BROADCAST COMMANDS ---
+@bot.message_handler(commands=['post_status', 'post_matrix', 'isp_status'])
+def cmd_post_isp_status(message):
+    """Admin command to post daily ISP status matrix and infographic to channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+    if post_daily_isp_status_to_channel():
+        bot.reply_to(message, "📢 جدول وضعیت روزانه اپراتورها با موفقیت به کانال ارسال شد.")
+    else:
+        bot.reply_to(message, "❌ خطا در ارسال به کانال.")
+
+
+@bot.message_handler(commands=['post_gaming'])
+def cmd_post_gaming(message):
+    """Admin command to post Gaming highlight and infographic to channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+    if post_gaming_showcase_to_channel():
+        bot.reply_to(message, "📢 پست گیمینگ با موفقیت به کانال ارسال شد.")
+    else:
+        bot.reply_to(message, "❌ خطا در ارسال به کانال.")
+
+
+@bot.message_handler(commands=['post_vip_card'])
+def cmd_post_vip_card(message):
+    """Admin command to post VIP/AI/Trading showcase to channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+    if post_vip_showcase_to_channel():
+        bot.reply_to(message, "📢 پست VIP با موفقیت به کانال ارسال شد.")
+    else:
+        bot.reply_to(message, "❌ خطا در ارسال به کانال.")
+
+
+@bot.message_handler(commands=['post_trial', 'post_free_trial'])
+def cmd_post_trial(message):
+    """Admin command to broadcast 24-Hour Free Trial announcement to channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+    if post_trial_showcase_to_channel():
+        bot.reply_to(message, "📢 بنر و متن تست رایگان با موفقیت به کانال ارسال شد.")
+    else:
+        bot.reply_to(message, "❌ خطا در ارسال به کانال.")
+
+
+@bot.message_handler(commands=['post_tutorial', 'post_guide'])
+def cmd_post_tutorial(message):
+    """Admin command to broadcast 3-step tutorial infographic to channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+    if post_tutorial_showcase_to_channel():
+        bot.reply_to(message, "📢 اینفوگرافیک آموزشی با موفقیت به کانال ارسال شد.")
+    else:
+        bot.reply_to(message, "❌ خطا در ارسال به کانال.")
+
+
+@bot.message_handler(commands=['post_poll', 'poll'])
+def cmd_post_poll(message):
+    """Admin command to post interactive polls to channel."""
+    if not is_admin(message.from_user) and not is_admin(message.chat.id):
+        bot.reply_to(message, "⛔ این دستور مخصوص مدیریت است.")
+        return
+    parts = message.text.split()
+    poll_type = parts[1].lower() if len(parts) > 1 else "speed"
+    if post_poll_to_channel(poll_type):
+        bot.reply_to(message, f"📊 نظرسنجی «{poll_type}» با موفقیت در کانال منتشر شد.")
+    else:
+        bot.reply_to(message, f"❌ خطا در ارسال نظرسنجی.")
 
 @bot.message_handler(commands=['trial', 'free_trial', 'test'])
 def cmd_user_trial(message):

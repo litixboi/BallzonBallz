@@ -235,7 +235,7 @@ def send_persian_announcement(bot, channel_id: str, bot_username: str, template_
             text,
             parse_mode="HTML",
             reply_markup=markup,
-            disable_web_page_preview=True
+            link_preview_options=types.LinkPreviewOptions(is_disabled=True)
         )
         logger.info("Successfully posted Persian announcement #%d ('%s') to %s", template_id, tmpl['title'], channel_id)
         return True
@@ -270,7 +270,7 @@ def post_full_tariffs_to_channel(bot, channel_id: str, bot_username: str = "liti
             TARIFF_ANNOUNCEMENT_FULL_TEXT,
             parse_mode="HTML",
             reply_markup=markup,
-            disable_web_page_preview=True
+            link_preview_options=types.LinkPreviewOptions(is_disabled=True)
         )
         logger.info("Successfully posted full tariff announcement to channel %s", channel_id)
         return True
