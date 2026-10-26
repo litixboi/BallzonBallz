@@ -3288,9 +3288,37 @@ def cmd_health(message):
         send_message_safe(message.chat.id, report, parse_mode="HTML")
 
 
+def get_tehran_datetime_str() -> str:
+    """Return formatted Solar Hijri date and Tehran local time with Persian numerals."""
+    try:
+        from datetime import timezone, timedelta
+        tehran_now = datetime.now(timezone.utc) + timedelta(hours=3, minutes=30)
+        gy, gm, gd = tehran_now.year, tehran_now.month, tehran_now.day
+        g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        gy2 = gy - 1600 if gy > 1600 else gy - 621
+        days = 365 * gy2 + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400 - 80 + gd + g_d_m[gm - 1]
+        if gm > 2 and ((gy % 4 == 0 and gy % 100 != 0) or (gy % 400 == 0)):
+            days += 1
+        jy = 979 + 33 * (days // 12053)
+        days %= 12053
+        jy += 4 * (days // 1461)
+        days %= 1461
+        if days > 365:
+            jy += (days - 1) // 365
+            days = (days - 1) % 365
+        jm = (days // 31) + 1 if days < 186 else ((days - 186) // 30) + 7
+        jd = (days % 31) + 1 if days < 186 else ((days - 186) % 30) + 1
+        months = ['فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'مرداد', 'شهریور', 'مهر', 'آبان', 'آذر', 'دی', 'بهمن', 'اسفند']
+        t_str = tehran_now.strftime('%H:%M')
+        raw = f"{jd} {months[jm - 1]} {jy} - ساعت {t_str} (به وقت تهران)"
+        return raw.translate(str.maketrans('0123456789', '۰۱۲۳۴۵۶۷۸۹'))
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
 def get_daily_isp_status_text() -> str:
     """Constructs real-time Cloudflare Radar, IODA, OONI & Xray-Observatory status matrix (<= 900 chars)."""
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = get_tehran_datetime_str()
     return (
         f"📊 <b>رادار پایش روزانه پایداری اینترنت LitixConnect</b>\n"
         f"🌐 <i>منابع پایش: رادار کلودفلر (Cloudflare Radar)، نت‌بلاکس (NetBlocks)، رادار IODA و پایگاه OONI</i>\n\n"
@@ -3779,7 +3807,7 @@ def post_radar_telemetry_report_to_channel() -> bool:
     if not CHANNEL_ID:
         return False
     clean_bot = (bot_username or "litixconnectBot").lstrip("@")
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = get_tehran_datetime_str()
 
     banner_caption = (
         f"📡 <b>گزارش رسمی رادار پایش اینترنت ایران | وضعیت اتصال عادی و بدون فیلترشکن</b>\n\n"
