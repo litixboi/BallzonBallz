@@ -1150,10 +1150,7 @@ def rebrand_config(config_line, country_key, index):
                     data["fp"] = "chrome"
                 if not data.get("alpn") and sec == "tls":
                     data["alpn"] = "h2,http/1.1"
-                if not data.get("fragment"):
-                    data["fragment"] = "100-200,10-20,tlshello"
-                if not data.get("mux"):
-                    data["mux"] = "true"
+
             updated_json = json.dumps(data, ensure_ascii=False).encode("utf-8")
             return f"vmess://{base64.b64encode(updated_json).decode('utf-8')}"
 
@@ -1170,10 +1167,7 @@ def rebrand_config(config_line, country_key, index):
                 port = main_part.split("@")[-1].split(":")[-1]
 
             if sec in ("tls", "reality") or port == "443":
-                if "fragment" not in flat_params:
-                    flat_params["fragment"] = "100-200,10-20,tlshello"
-                if "mux" not in flat_params:
-                    flat_params["mux"] = "true"
+
                 if "fp" not in flat_params or not flat_params["fp"]:
                     flat_params["fp"] = "chrome"
                 if sec == "tls" and "alpn" not in flat_params:
