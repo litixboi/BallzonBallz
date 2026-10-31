@@ -437,9 +437,9 @@ class GeminiReceiptOCR:
 
     # Candidate models in preferred order
     CANDIDATE_MODELS = [
+        "gemini-3.5-flash",
         "gemini-3.1-flash-lite",
         "gemini-3.8-flash",
-        "gemini-3.5-flash",
         "gemini-flash-latest",
     ]
 
@@ -786,6 +786,11 @@ class BankSMSManager:
                     return None
 
                 target_rials = s_row["total_amount_rials"]
+                base_toman = s_row["base_amount_toman"]
+                suffix = s_row["suffix"]
+                # Customer might enter Tomans in banking app: (base_toman + suffix) * 10
+                alt_rials = (base_toman + suffix) * 10
+                base_rials = s_row["base_amount_rials"]
                 reserved_at = s_row["reserved_at"]
 
                 # Fetch receipt if any
@@ -801,14 +806,16 @@ class BankSMSManager:
                 candidate_sms = conn.execute(
                     """
                     SELECT * FROM bank_sms
-                    WHERE is_used = 0 AND timestamp_tehran >= ? AND amount_rials = ?
+                    WHERE is_used = 0 AND timestamp_tehran >= ? 
+                      AND (amount_rials = ? OR amount_rials = ? OR (amount_rials = ? AND ? IS NOT NULL))
                     ORDER BY timestamp_tehran ASC
                     """,
-                    (cutoff_ts, target_rials),
+                    (cutoff_ts, target_rials, alt_rials, base_rials, expected_trace),
                 ).fetchall()
 
                 for sms in candidate_sms:
-                    if self._verify_match(sms, reserved_at, expected_trace, conn):
+                    is_exact_unique = (sms["amount_rials"] in (target_rials, alt_rials))
+                    if self._verify_match(sms, reserved_at, expected_trace, conn, is_exact_unique=is_exact_unique):
                         return self._finalize_match(order_id, sms, conn)
 
         return None
@@ -821,19 +828,25 @@ class BankSMSManager:
 
         with _lock:
             with self.db._get_connection() as conn:
-                # Find active Rial suffix reservations matching this exact amount
-                cutoff_ts = time.time() - self.MATCHING_WINDOW_SECONDS
+                # Find active reservations matching exact rials or toman-converted rials or base amount
                 candidates = conn.execute(
                     """
                     SELECT * FROM rial_suffixes
-                    WHERE total_amount_rials = ? AND is_active = 1
+                    WHERE is_active = 1 AND (
+                        total_amount_rials = ? 
+                        OR ((base_amount_toman + suffix) * 10) = ?
+                        OR base_amount_rials = ?
+                    )
                     """,
-                    (sms_amount,),
+                    (sms_amount, sms_amount, sms_amount),
                 ).fetchall()
 
                 for cand in candidates:
                     order_id = cand["order_id"]
                     reserved_at = cand["reserved_at"]
+                    target_rials = cand["total_amount_rials"]
+                    alt_rials = (cand["base_amount_toman"] + cand["suffix"]) * 10
+                    is_exact_unique = (sms_amount in (target_rials, alt_rials))
 
                     # Check receipt trace if customer already uploaded
                     r_row = conn.execute(
@@ -842,7 +855,7 @@ class BankSMSManager:
                     ).fetchone()
                     expected_trace = r_row["trace_number"].strip() if r_row and r_row["trace_number"] else None
 
-                    if self._verify_match(sms, reserved_at, expected_trace, conn):
+                    if self._verify_match(sms, reserved_at, expected_trace, conn, is_exact_unique=is_exact_unique):
                         return self._finalize_match(order_id, sms, conn)
 
         return None
@@ -853,10 +866,20 @@ class BankSMSManager:
         order_reserved_at: float,
         expected_trace: Optional[str],
         conn: sqlite3.Connection,
+        is_exact_unique: bool = True,
     ) -> bool:
         """Evaluate the 4 strict matching criteria."""
         sms_ts = sms["timestamp_tehran"]
         sms_trace = (sms["trace_number"] or "").strip()
+
+        if not is_exact_unique:
+            # If amount matched base without unique suffix, require verified trace match to prevent false collision
+            if not expected_trace or not sms_trace:
+                return False
+            clean_exp = re.sub(r"\D", "", expected_trace)
+            clean_sms = re.sub(r"\D", "", sms_trace)
+            if not (clean_exp and clean_sms and (clean_exp in clean_sms or clean_sms in clean_exp)):
+                return False
 
         # Rule 1: Strict Amount Match (already filtered by SQL amount_rials == target_rials)
 

@@ -186,10 +186,51 @@ class ConpanelClient:
         if not self.ensure_auth():
             return False
         headers = {"X-CSRF-Token": self.csrf_token}
+        target_uuid = client_payload.get("uuid") or str(client_payload.get("id", ""))
+        clean_client = {
+            "id": target_uuid,
+            "security": client_payload.get("security", ""),
+            "email": email,
+            "limitIp": int(client_payload.get("limitIp", 0)),
+            "limitHwid": int(client_payload.get("limitHwid", 0)),
+            "totalGB": int(client_payload.get("totalGB", 0)),
+            "expiryTime": int(client_payload.get("expiryTime", 0)),
+            "enable": bool(client_payload.get("enable", True)),
+            "tgId": client_payload.get("tgId"),
+            "subId": client_payload.get("subId", ""),
+            "group": client_payload.get("group", "Customers"),
+            "comment": client_payload.get("comment", ""),
+            "trafficReset": client_payload.get("trafficReset", "never"),
+            "trafficResetDay": int(client_payload.get("trafficResetDay", 1)),
+        }
+        import_body = {
+            "data": json.dumps([
+                {
+                    "client": clean_client,
+                    "inboundIds": [1, 2]
+                }
+            ])
+        }
+        try:
+            r = self.session.post(
+                f"{self.base_url}/panel/api/clients/import",
+                json=import_body,
+                headers=headers,
+                timeout=(5.0, 15.0),
+            )
+            if r.status_code == 200 and r.json().get("success", False):
+                try:
+                    self.session.delete(f"{self.base_url}/panel/api/clients/hwids/{email}", headers=headers, timeout=(3.0, 5.0))
+                except Exception:
+                    pass
+                return True
+        except Exception as e:
+            logger.warning("[%s] Import update failed for '%s': %s", self.name, email, e)
+
         try:
             r = self.session.post(
                 f"{self.base_url}/panel/api/clients/update/{email}",
-                json=client_payload,
+                json=clean_client,
                 headers=headers,
                 timeout=(5.0, 10.0),
             )
@@ -229,7 +270,7 @@ class ConpanelClient:
         email: str,
         total_gb: int,
         expiry_days: int,
-        limit_hwid: int = 1,
+        limit_hwid: int = 0,
         tg_id: Optional[int] = None,
         inbound_id: int = 1,
         inbound_ids: Optional[List[int]] = None,
@@ -249,7 +290,7 @@ class ConpanelClient:
 
         if existing_client and is_renewal:
             # Idempotent renewal: extend expiry and increase/reset total quota
-            client_uuid = existing_client.get("id")
+            client_uuid = existing_client.get("uuid") or existing_client.get("id")
             sub_id = existing_client.get("subId")
             existing_expiry = existing_client.get("expiryTime", 0)
             base_expiry = max(existing_expiry, now_ms)
@@ -259,9 +300,13 @@ class ConpanelClient:
             existing_client["expiryTime"] = new_expiry
             existing_client["totalGB"] = new_total
             existing_client["enable"] = True
-            existing_client["limitHwid"] = max(existing_client.get("limitHwid", 1), limit_hwid)
+            existing_client["limitHwid"] = limit_hwid
 
             if self.update_client(email, existing_client):
+                try:
+                    self.session.delete(f"{self.base_url}/panel/api/clients/hwids/{email}", headers=headers, timeout=(3.0, 5.0))
+                except Exception:
+                    pass
                 logger.info("[%s] Renewed client '%s': +%dGB, new_expiry=%d", self.name, email, total_gb, new_expiry)
                 return self._build_sub_response(email, client_uuid, sub_id, total_gb, expiry_days, limit_hwid)
             else:
@@ -323,6 +368,10 @@ class ConpanelClient:
             )
             res_data = r.json()
             if r.status_code == 200 and res_data.get("success"):
+                try:
+                    self.session.delete(f"{self.base_url}/panel/api/clients/hwids/{email}", headers=headers, timeout=(3.0, 5.0))
+                except Exception:
+                    pass
                 logger.info("[%s] Successfully created client '%s' (UUID: %s, subId: %s)", self.name, email, client_uuid, sub_id)
                 return self._build_sub_response(email, client_uuid, sub_id, total_gb, expiry_days, limit_hwid)
             else:

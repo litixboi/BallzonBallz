@@ -4823,7 +4823,10 @@ def fulfill_and_deliver_order(order_id: str, auto_matched: bool = False, match_d
             f"🔑 <b>نام کلاینت در پنل:</b> <code>{delivered_subs[0].get('email', '')}</code> روی سرور conpanel-bot"
         )
         for admin_chat in get_admin_chat_ids():
-            send_message_safe(admin_chat, admin_alert, parse_mode="HTML")
+            try:
+                send_message_safe(admin_chat, admin_alert, parse_mode="HTML")
+            except Exception as err_admin:
+                logger.error("Failed to notify admin %s: %s", admin_chat, err_admin)
 
     return True, "OK"
 
@@ -4905,6 +4908,24 @@ def handle_admin_decision(call):
 
 
 # --- USER PAYMENT RECEIPT LISTENER (Photo or Text TxID) ---
+@bot.message_handler(content_types=['photo'], func=lambda m: not bool(get_pending_tx_order(m.chat.id)))
+def handle_unsolicited_photo(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    latest_order = order_mgr.get_user_latest_unpaid_order(user_id)
+    if latest_order:
+        logger.info("Auto-linking unsolicited photo from user %s to pending order %s", user_id, latest_order['order_id'])
+        set_pending_tx_order(chat_id, latest_order["order_id"])
+        handle_payment_receipt_upload(message)
+    else:
+        bot.reply_to(
+            message,
+            "📸 <b>تصویر فیش/رسید دریافت شد، اما هیچ سفارش پرداخت‌نشده‌ای برای حساب شما یافت نشد.</b>\n\n"
+            "برای خرید یا تمدید اشتراک، از دکمه‌های منو یا دستور /buy استفاده فرمایید.",
+            parse_mode="HTML"
+        )
+
+
 @bot.message_handler(content_types=['text', 'photo'], func=lambda m: bool(get_pending_tx_order(m.chat.id)))
 def handle_payment_receipt_upload(message):
     chat_id = message.chat.id
